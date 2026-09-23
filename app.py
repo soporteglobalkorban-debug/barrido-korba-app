@@ -29,7 +29,7 @@ EXCEL_HISTORIAL_PATH = os.path.join(BASE_DIR, "registro_observaciones.xlsx")
 EXCEL_DRIVE_NAME = "registro_observaciones_korban.xlsx"
 
 # ==========================================
-# 3. FUNCIONES PARA GOOGLE DRIVE API (ACUMULACIÓN DÍA A DÍA)
+# 3. FUNCIONES PARA GOOGLE DRIVE API & EXCEL
 # ==========================================
 def obtener_servicio_drive():
     """Autentica y devuelve el cliente de Google Drive corrigiendo saltos de línea en TOML."""
@@ -46,6 +46,68 @@ def obtener_servicio_drive():
         scopes=["https://www.googleapis.com/auth/drive"]
     )
     return build("drive", "v3", credentials=credentials)
+
+def generar_excel_reporte(df_data):
+    """
+    Genera un archivo Excel en un buffer de memoria con estilo corporativo
+    a partir del DataFrame de unidades críticas.
+    """
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_data.to_excel(writer, index=False, sheet_name="Diagnostico_Flotilla")
+        
+        # Aplicar formato básico si openpyxl está disponible
+        workbook = writer.book
+        worksheet = writer.sheets["Diagnostico_Flotilla"]
+        
+        # Ajustar ancho de columnas
+        for col in worksheet.columns:
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            col_letter = col[0].column_letter
+            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 12)
+            
+    buffer.seek(0)
+    return buffer
+
+def subir_reporte_a_drive(df_reporte, nombre_archivo=None):
+    """
+    Sube un reporte individual en formato Excel a Google Drive en la carpeta especificada.
+    """
+    try:
+        drive_folder_id = st.secrets.get("DRIVE_FOLDER_ID", "")
+        if not drive_folder_id or "COLOCA" in drive_folder_id:
+            return False, "Falta configurar 'DRIVE_FOLDER_ID' en los Secrets de Streamlit.", None
+
+        if not nombre_archivo:
+            fecha_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+            nombre_archivo = f"Reporte_Diagnostico_Wialon_{fecha_str}.xlsx"
+
+        service = obtener_servicio_drive()
+        buffer = generar_excel_reporte(df_reporte)
+
+        media = MediaIoBaseUpload(
+            buffer,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            resumable=False
+        )
+
+        file_metadata = {
+            "name": nombre_archivo,
+            "parents": [drive_folder_id]
+        }
+
+        archivo_creado = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, name",
+            supportsAllDrives=True
+        ).execute()
+
+        msg = f"Reporte '{archivo_creado.get('name')}' subido exitosamente a Google Drive."
+        return True, msg, archivo_creado.get("id")
+
+    except Exception as e:
+        return False, f"Error al subir el reporte a Google Drive: {str(e)}", None
 
 def sincronizar_excel_con_drive(df_nuevas_observaciones):
     """
@@ -500,15 +562,24 @@ if "data_unidades" in st.session_state:
         },
     )
 
+    # Botón de descarga directa del reporte completo
+    buffer_excel = generar_excel_reporte(edited_df)
+    st.download_button(
+        label="📥 Descargar Reporte Completo (Excel)",
+        data=buffer_excel,
+        file_name=f"Reporte_Diagnostico_Wialon_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
     st.divider()
 
     # ==========================================
     # 9. GUARDAR HISTÓRICO Y SINCRONIZAR
     # ==========================================
-    st.subheader("💾 Registro Histórico de Observaciones")
-    col_guardar, col_descargar = st.columns([1, 1])
+    st.subheader("💾 Registro Histórico de Observaciones y Reportes")
+    col_guardar_obs, col_subir_reporte, col_descargar_local = st.columns([1, 1, 1])
 
-    with col_guardar:
+    with col_guardar_obs:
         if st.button("💾 Guardar y Acumular en Google Drive"):
             # Filtrar solo las filas donde escribiste una observación
             filas_con_obs = edited_df[
@@ -543,11 +614,20 @@ if "data_unidades" in st.session_state:
                     else:
                         st.error(f"❌ {mensaje}")
 
-    with col_descargar:
+    with col_subir_reporte:
+        if st.button("📤 Guardar y Subir Reporte Completo a Google Drive"):
+            with st.spinner("☁️ Generando y subiendo archivo Excel a Google Drive..."):
+                exito_rep, msg_rep, _ = subir_reporte_a_drive(edited_df)
+                if exito_rep:
+                    st.success(f"✅ {msg_rep}")
+                else:
+                    st.error(f"❌ {msg_rep}")
+
+    with col_descargar_local:
         if os.path.exists(EXCEL_HISTORIAL_PATH):
             with open(EXCEL_HISTORIAL_PATH, "rb") as file_excel:
                 st.download_button(
-                    label="📥 Descargar Copia Histórica Local (Excel)",
+                    label="📥 Descargar Histórico Local (Excel)",
                     data=file_excel,
                     file_name="registro_observaciones_korban.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

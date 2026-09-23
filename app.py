@@ -56,11 +56,9 @@ def generar_excel_reporte(df_data):
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df_data.to_excel(writer, index=False, sheet_name="Diagnostico_Flotilla")
         
-        # Aplicar formato básico si openpyxl está disponible
         workbook = writer.book
         worksheet = writer.sheets["Diagnostico_Flotilla"]
         
-        # Ajustar ancho de columnas
         for col in worksheet.columns:
             max_len = max(len(str(cell.value or '')) for cell in col)
             col_letter = col[0].column_letter
@@ -562,7 +560,6 @@ if "data_unidades" in st.session_state:
         },
     )
 
-    # Botón de descarga directa del reporte completo
     buffer_excel = generar_excel_reporte(edited_df)
     st.download_button(
         label="📥 Descargar Reporte Completo (Excel)",
@@ -581,7 +578,6 @@ if "data_unidades" in st.session_state:
 
     with col_guardar_obs:
         if st.button("💾 Guardar y Acumular en Google Drive"):
-            # Filtrar solo las filas donde escribiste una observación
             filas_con_obs = edited_df[
                 edited_df["Observación"].astype(str).str.strip().ne("")
                 & edited_df["Observación"].notna()
@@ -590,7 +586,6 @@ if "data_unidades" in st.session_state:
             if filas_con_obs.empty:
                 st.warning("⚠️ Escribe al menos una observación en la tabla antes de guardar.")
             else:
-                # Marcar la fecha/hora exacta del registro actual
                 filas_con_obs["Fecha Registro"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 columnas_historial = [
                     "Fecha Registro",
@@ -606,7 +601,6 @@ if "data_unidades" in st.session_state:
                 ]
                 df_nuevas = filas_con_obs[columnas_historial]
 
-                # Sincronizar y acumular día a día con Google Drive
                 with st.spinner("☁️ Conectando con Google Drive y actualizando el historial..."):
                     exito, mensaje, df_acumulado = sincronizar_excel_con_drive(df_nuevas)
                     if exito:

@@ -9,7 +9,7 @@ import requests
 import streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # ==========================================
 # 1. CONFIGURACIÓN DE PÁGINA
@@ -29,16 +29,15 @@ EXCEL_HISTORIAL_PATH = os.path.join(BASE_DIR, "registro_observaciones.xlsx")
 EXCEL_DRIVE_NAME = "registro_observaciones_korban.xlsx"
 
 # ==========================================
-# 3. FUNCIONES PARA GOOGLE DRIVE API
+# 3. FUNCIONES PARA GOOGLE DRIVE API (ACUMULACIÓN DÍA A DÍA)
 # ==========================================
 def obtener_servicio_drive():
-    """Autentica y devuelve el servicio de Google Drive corrigiendo saltos de linea en TOML."""
+    """Autentica y devuelve el cliente de Google Drive corrigiendo saltos de línea en TOML."""
     if "gcp_service_account" not in st.secrets:
         raise ValueError("No se encontraron las credenciales [gcp_service_account] en Streamlit Secrets.")
     
     creds_dict = dict(st.secrets["gcp_service_account"])
     
-    # Corrección clave para la lectura de private_key desde archivos TOML
     if "private_key" in creds_dict and isinstance(creds_dict["private_key"], str):
         creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
         
@@ -48,26 +47,19 @@ def obtener_servicio_drive():
     )
     return build("drive", "v3", credentials=credentials)
 
-def sincronizar_excel_con_drive(df_nuevo):
-    """Sube o actualiza el registro histórico en Google Drive con validación de ID."""
+def sincronizar_excel_con_drive(df_nuevas_observaciones):
+    """
+    Descarga el Excel existente en Google Drive (si existe), concatena las nuevas
+    observaciones acumulando el historial día a día, y vuelve a subir la versión actualizada.
+    """
     try:
-        drive_folder_id = st.secrets.get("DRIVE_FOLDER_ID", "COLOCA_AQUI_EL_ID_DE_LA_CARPETA_EN_DRIVE")
-        if not drive_folder_id or drive_folder_id == "COLOCA_AQUI_EL_ID_DE_LA_CARPETA_EN_DRIVE":
-            return False, "Falta configurar 'DRIVE_FOLDER_ID' en los Secrets de Streamlit."
+        drive_folder_id = st.secrets.get("DRIVE_FOLDER_ID", "")
+        if not drive_folder_id or "COLOCA" in drive_folder_id:
+            return False, "Falta configurar 'DRIVE_FOLDER_ID' en los Secrets de Streamlit.", None
 
         service = obtener_servicio_drive()
-        
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df_nuevo.to_excel(writer, index=False, sheet_name="Observaciones")
-        buffer.seek(0)
-        
-        media = MediaIoBaseUpload(
-            buffer,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            resumable=False
-        )
 
+        # 1. Buscar si el archivo Excel ya existe en la carpeta de Drive
         query = f"'{drive_folder_id}' in parents and name = '{EXCEL_DRIVE_NAME}' and trashed = false"
         results = service.files().list(
             q=query, 
@@ -78,14 +70,45 @@ def sincronizar_excel_con_drive(df_nuevo):
         
         files = results.get("files", [])
 
+        # 2. Si el archivo existe en Drive, descargarlo y concatenar lo nuevo
         if files:
             file_id = files[0]["id"]
+            request = service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            
+            fh.seek(0)
+            df_existente_drive = pd.read_excel(fh)
+            
+            # Concatenar los registros previos con los del día actual
+            df_completo = pd.concat([df_existente_drive, df_nuevas_observaciones], ignore_index=True)
+        else:
+            file_id = None
+            df_completo = df_nuevas_observaciones
+
+        # 3. Guardar el DataFrame completo acumulado en un buffer de memoria
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df_completo.to_excel(writer, index=False, sheet_name="Observaciones")
+        buffer.seek(0)
+        
+        media = MediaIoBaseUpload(
+            buffer,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            resumable=False
+        )
+
+        # 4. Actualizar el archivo en Drive o crearlo por primera vez
+        if file_id:
             service.files().update(
                 fileId=file_id, 
                 media_body=media,
                 supportsAllDrives=True
             ).execute()
-            return True, f"Archivo actualizado exitosamente en Google Drive."
+            msg = f"Se agregaron {len(df_nuevas_observaciones)} registro(s) al histórico en Google Drive (Total acumulado: {len(df_completo)} registros)."
         else:
             file_metadata = {
                 "name": EXCEL_DRIVE_NAME,
@@ -97,10 +120,15 @@ def sincronizar_excel_con_drive(df_nuevo):
                 fields="id",
                 supportsAllDrives=True
             ).execute()
-            return True, f"Archivo nuevo creado exitosamente en Google Drive."
+            msg = f"Archivo inicial creado exitosamente en Google Drive con {len(df_completo)} registro(s)."
+
+        # 5. Guardar también una copia local sincronizada
+        df_completo.to_excel(EXCEL_HISTORIAL_PATH, index=False)
+
+        return True, msg, df_completo
             
     except Exception as e:
-        return False, f"Error de Google Drive API: {str(e)}"
+        return False, f"Error al sincronizar con Google Drive: {str(e)}", None
 
 # ==========================================
 # 4. ESTILOS CSS PERSONALIZADOS
@@ -251,7 +279,7 @@ if btn_consultar:
         try:
             url = "https://hst-api.wialon.com/wialon/ajax.html"
 
-            # 1. Login con validaciones de seguridad
+            # Login con Wialon
             res_login_req = requests.get(
                 url,
                 params={
@@ -265,7 +293,7 @@ if btn_consultar:
 
             if not login_res or not isinstance(login_res, dict) or "error" in login_res:
                 error_code = login_res.get("error") if isinstance(login_res, dict) else "Sin respuesta"
-                st.error(f"❌ Error de autenticación en Wialon (Código: {error_code}). Tu token venció o es inválido. Genera uno nuevo en Wialon.")
+                st.error(f"❌ Error de autenticación en Wialon (Código: {error_code}). Revisa o renueva tu Token.")
                 st.stop()
 
             sid = login_res.get("eid") or (
@@ -275,10 +303,10 @@ if btn_consultar:
             )
 
             if not sid:
-                st.error("❌ No se pudo obtener la sesión (SID) de Wialon. Verifica la validez del token.")
+                st.error("❌ No se pudo obtener la sesión (SID) de Wialon.")
                 st.stop()
 
-            # 2. Consultar Grupos
+            # Consultar Grupos
             params_grupos = {
                 "spec": {
                     "itemsType": "avl_unit_group",
@@ -313,7 +341,7 @@ if btn_consultar:
                             mapa_grupos[u_id] = []
                         mapa_grupos[u_id].append(nombre_grupo)
 
-            # 3. Consultar Unidades
+            # Consultar Unidades
             flags_unidades = 1 + 1024 + 4096 + 1048576 + 2097152
             params_unidades = {
                 "spec": {
@@ -434,13 +462,13 @@ if btn_consultar:
 
             st.session_state["data_unidades"] = df
             st.session_state["total_evaluadas"] = len(unidades)
-            st.toast("✅ Diagnóstico completado con éxito.", icon="🎉")
+            st.toast("✅ Consulta realizada con éxito.", icon="🎉")
 
         except Exception as e:
-            st.error(f"❌ Ocurrió un error al consultar Wialon: {e}")
+            st.error(f"❌ Ocurrió un error inesperado al consultar Wialon: {e}")
 
 # ==========================================
-# 8. VISUALIZACIÓN Y RESULTADOS
+# 8. VISUALIZACIÓN DE RESULTADOS
 # ==========================================
 if "data_unidades" in st.session_state:
     df = st.session_state["data_unidades"]
@@ -475,21 +503,23 @@ if "data_unidades" in st.session_state:
     st.divider()
 
     # ==========================================
-    # 9. GUARDAR E HISTORIAL (LOCAL Y DRIVE)
+    # 9. GUARDAR HISTÓRICO Y SINCRONIZAR
     # ==========================================
     st.subheader("💾 Registro Histórico de Observaciones")
     col_guardar, col_descargar = st.columns([1, 1])
 
     with col_guardar:
-        if st.button("💾 Guardar y Sincronizar con Google Drive"):
+        if st.button("💾 Guardar y Acumular en Google Drive"):
+            # Filtrar solo las filas donde escribiste una observación
             filas_con_obs = edited_df[
                 edited_df["Observación"].astype(str).str.strip().ne("")
                 & edited_df["Observación"].notna()
             ].copy()
 
             if filas_con_obs.empty:
-                st.warning("⚠️ No hay observaciones escritas en la tabla para guardar.")
+                st.warning("⚠️ Escribe al menos una observación en la tabla antes de guardar.")
             else:
+                # Marcar la fecha/hora exacta del registro actual
                 filas_con_obs["Fecha Registro"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 columnas_historial = [
                     "Fecha Registro",
@@ -503,35 +533,21 @@ if "data_unidades" in st.session_state:
                     "Días Sin Reporte",
                     "Diagnóstico",
                 ]
-                df_guardar = filas_con_obs[columnas_historial]
+                df_nuevas = filas_con_obs[columnas_historial]
 
-                # 1. Guardar copia local
-                try:
-                    if os.path.exists(EXCEL_HISTORIAL_PATH):
-                        df_existente = pd.read_excel(EXCEL_HISTORIAL_PATH)
-                        df_final = pd.concat([df_existente, df_guardar], ignore_index=True)
+                # Sincronizar y acumular día a día con Google Drive
+                with st.spinner("☁️ Conectando con Google Drive y actualizando el historial..."):
+                    exito, mensaje, df_acumulado = sincronizar_excel_con_drive(df_nuevas)
+                    if exito:
+                        st.success(f"✅ {mensaje}")
                     else:
-                        df_final = df_guardar
-
-                    df_final.to_excel(EXCEL_HISTORIAL_PATH, index=False)
-                    st.success(f"✅ ¡Se guardaron {len(df_guardar)} observación(es) en el archivo local!")
-                except Exception as ex:
-                    st.error(f"❌ Error al guardar localmente: {ex}")
-                    df_final = df_guardar
-
-                # 2. Sincronizar automáticamente con Google Drive
-                with st.spinner("☁️ Sincronizando con Google Drive..."):
-                    exito_drive, mensaje_drive = sincronizar_excel_con_drive(df_final)
-                    if exito_drive:
-                        st.success(f"☁️ **Google Drive:** {mensaje_drive}")
-                    else:
-                        st.error(f"⚠️ {mensaje_drive}")
+                        st.error(f"❌ {mensaje}")
 
     with col_descargar:
         if os.path.exists(EXCEL_HISTORIAL_PATH):
             with open(EXCEL_HISTORIAL_PATH, "rb") as file_excel:
                 st.download_button(
-                    label="📥 Descargar Excel Histórico Local",
+                    label="📥 Descargar Copia Histórica Local (Excel)",
                     data=file_excel,
                     file_name="registro_observaciones_korban.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -540,7 +556,7 @@ if "data_unidades" in st.session_state:
     st.divider()
 
     # ==========================================
-    # 10. ENVÍO DE NOTIFICACIONES WHATSAPP
+    # 10. ENVÍO DE MENSAJES WHATSAPP
     # ==========================================
     st.subheader("📲 Envío y Personalización de Alertas por WhatsApp")
 
@@ -586,3 +602,4 @@ if "data_unidades" in st.session_state:
             if numero_wa and numero_wa != "nan":
                 link_wa = f"https://wa.me/{numero_wa}?text={msg_encoded}"
                 st.link_button("💬 Enviar WhatsApp Personalizado", link_wa)
+            

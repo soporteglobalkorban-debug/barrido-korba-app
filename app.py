@@ -48,10 +48,7 @@ def obtener_servicio_drive():
     return build("drive", "v3", credentials=credentials)
 
 def generar_excel_reporte(df_data):
-    """
-    Genera un archivo Excel en un buffer de memoria con estilo corporativo
-    a partir del DataFrame de unidades críticas.
-    """
+    """Genera un archivo Excel en memoria con formato."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df_data.to_excel(writer, index=False, sheet_name="Diagnostico_Flotilla")
@@ -67,50 +64,9 @@ def generar_excel_reporte(df_data):
     buffer.seek(0)
     return buffer
 
-def subir_reporte_a_drive(df_reporte, nombre_archivo=None):
-    """
-    Sube un reporte individual en formato Excel a Google Drive en la carpeta especificada.
-    """
-    try:
-        drive_folder_id = st.secrets.get("DRIVE_FOLDER_ID", "")
-        if not drive_folder_id or "COLOCA" in drive_folder_id:
-            return False, "Falta configurar 'DRIVE_FOLDER_ID' en los Secrets de Streamlit.", None
-
-        if not nombre_archivo:
-            fecha_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
-            nombre_archivo = f"Reporte_Diagnostico_Wialon_{fecha_str}.xlsx"
-
-        service = obtener_servicio_drive()
-        buffer = generar_excel_reporte(df_reporte)
-
-        media = MediaIoBaseUpload(
-            buffer,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            resumable=False
-        )
-
-        file_metadata = {
-            "name": nombre_archivo,
-            "parents": [drive_folder_id]
-        }
-
-        archivo_creado = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, name",
-            supportsAllDrives=True
-        ).execute()
-
-        msg = f"Reporte '{archivo_creado.get('name')}' subido exitosamente a Google Drive."
-        return True, msg, archivo_creado.get("id")
-
-    except Exception as e:
-        return False, f"Error al subir el reporte a Google Drive: {str(e)}", None
-
 def sincronizar_excel_con_drive(df_nuevas_observaciones):
     """
-    Descarga el Excel existente en Google Drive (si existe), concatena las nuevas
-    observaciones acumulando el historial día a día, y vuelve a subir la versión actualizada.
+    Sincroniza y acumula las observaciones en Google Drive y guarda copia local.
     """
     try:
         drive_folder_id = st.secrets.get("DRIVE_FOLDER_ID", "")
@@ -130,7 +86,7 @@ def sincronizar_excel_con_drive(df_nuevas_observaciones):
         
         files = results.get("files", [])
 
-        # 2. Si el archivo existe en Drive, descargarlo y concatenar lo nuevo
+        # 2. Si el archivo existe en Drive, descargarlo y concatenar
         if files:
             file_id = files[0]["id"]
             request = service.files().get_media(fileId=file_id)
@@ -143,13 +99,12 @@ def sincronizar_excel_con_drive(df_nuevas_observaciones):
             fh.seek(0)
             df_existente_drive = pd.read_excel(fh)
             
-            # Concatenar los registros previos con los del día actual
             df_completo = pd.concat([df_existente_drive, df_nuevas_observaciones], ignore_index=True)
         else:
             file_id = None
             df_completo = df_nuevas_observaciones
 
-        # 3. Guardar el DataFrame completo acumulado en un buffer de memoria
+        # 3. Guardar el DataFrame completo en un buffer
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df_completo.to_excel(writer, index=False, sheet_name="Observaciones")
@@ -161,14 +116,14 @@ def sincronizar_excel_con_drive(df_nuevas_observaciones):
             resumable=False
         )
 
-        # 4. Actualizar el archivo en Drive o crearlo por primera vez
+        # 4. Actualizar o crear en Drive
         if file_id:
             service.files().update(
                 fileId=file_id, 
                 media_body=media,
                 supportsAllDrives=True
             ).execute()
-            msg = f"Se agregaron {len(df_nuevas_observaciones)} registro(s) al histórico en Google Drive (Total acumulado: {len(df_completo)} registros)."
+            msg = f"Se agregaron {len(df_nuevas_observaciones)} registro(s) al histórico en Google Drive (Total: {len(df_completo)})."
         else:
             file_metadata = {
                 "name": EXCEL_DRIVE_NAME,
@@ -180,9 +135,9 @@ def sincronizar_excel_con_drive(df_nuevas_observaciones):
                 fields="id",
                 supportsAllDrives=True
             ).execute()
-            msg = f"Archivo inicial creado exitosamente en Google Drive con {len(df_completo)} registro(s)."
+            msg = f"Archivo inicial creado en Google Drive con {len(df_completo)} registro(s)."
 
-        # 5. Guardar también una copia local sincronizada
+        # 5. Guardar copia local
         df_completo.to_excel(EXCEL_HISTORIAL_PATH, index=False)
 
         return True, msg, df_completo
@@ -230,10 +185,6 @@ st.markdown(
         color: #f1f5f9 !important;
     }
 
-    [data-testid="stSidebarCollapseButton"] span {
-        font-size: 0px !important;
-    }
-
     /* Tarjetas de Métricas */
     [data-testid="stMetric"] {
         background-color: #ffffff;
@@ -241,17 +192,6 @@ st.markdown(
         border-radius: 10px;
         padding: 15px 20px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.02);
-    }
-    
-    [data-testid="stMetricLabel"] {
-        color: #64748b !important;
-        font-weight: 500;
-        font-size: 0.85rem;
-    }
-    
-    [data-testid="stMetricValue"] {
-        color: #0f172a !important;
-        font-weight: 700;
     }
 
     /* Botones principales */
@@ -262,12 +202,11 @@ st.markdown(
         border: none !important;
         font-weight: 500 !important;
         padding: 0.5rem 1rem !important;
-        transition: all 0.2s ease-in-out;
+        width: 100%;
     }
 
     .stButton > button:hover {
         background-color: #0369a1 !important;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
     }
 
     /* Botón WhatsApp */
@@ -282,17 +221,6 @@ st.markdown(
     .stLinkButton > a:hover {
         background-color: #15803d !important;
     }
-
-    /* Cajas de texto */
-    .stTextArea textarea, .stSelectbox div[data-baseweb="select"] {
-        border-radius: 8px !important;
-        border: 1px solid #cbd5e1 !important;
-        background-color: #ffffff !important;
-    }
-
-    .stAlert {
-        border-radius: 8px !important;
-    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -306,8 +234,6 @@ col_logo, col_titulo = st.columns([1, 4])
 with col_logo:
     if os.path.exists(LOGO_PATH):
         st.image(LOGO_PATH, width=190)
-    else:
-        st.caption("📷 *Guarda la imagen como 'logo.png' junto a app.py*")
 
 with col_titulo:
     st.title("📡 Panel de Diagnóstico Wialon")
@@ -339,7 +265,7 @@ if btn_consultar:
         try:
             url = "https://hst-api.wialon.com/wialon/ajax.html"
 
-            # Login con Wialon
+            # Login
             res_login_req = requests.get(
                 url,
                 params={
@@ -348,12 +274,11 @@ if btn_consultar:
                 },
                 timeout=30,
             )
-            
             login_res = res_login_req.json() if res_login_req is not None else None
 
             if not login_res or not isinstance(login_res, dict) or "error" in login_res:
                 error_code = login_res.get("error") if isinstance(login_res, dict) else "Sin respuesta"
-                st.error(f"❌ Error de autenticación en Wialon (Código: {error_code}). Revisa o renueva tu Token.")
+                st.error(f"❌ Error de autenticación en Wialon (Código: {error_code}). Revisa tu Token.")
                 st.stop()
 
             sid = login_res.get("eid") or (
@@ -382,11 +307,7 @@ if btn_consultar:
 
             res_grupos_req = requests.get(
                 url,
-                params={
-                    "svc": "core/search_items",
-                    "params": json.dumps(params_grupos),
-                    "sid": sid,
-                },
+                params={"svc": "core/search_items", "params": json.dumps(params_grupos), "sid": sid},
                 timeout=30,
             )
             res_grupos = res_grupos_req.json() if res_grupos_req is not None else {}
@@ -418,11 +339,7 @@ if btn_consultar:
 
             res_req = requests.get(
                 url,
-                params={
-                    "svc": "core/search_items",
-                    "params": json.dumps(params_unidades),
-                    "sid": sid,
-                },
+                params={"svc": "core/search_items", "params": json.dumps(params_unidades), "sid": sid},
                 timeout=30,
             )
             res = res_req.json() if res_req is not None else {}
@@ -473,16 +390,14 @@ if btn_consultar:
                 texto_bateria = " | ".join(info_bateria) if info_bateria else "Sin sensores de batería"
 
                 if not t:
-                    estado_conexion = "🔴 FALLA FÍSICA"
-                    diagnostico = "Sin registros o equipo no configurado"
                     data.append({
                         "Unidad": u.get("nm"),
                         "Cliente / Grupo": cliente_grupo,
                         "Último Reporte": "SIN DATOS",
                         "Días Sin Reporte": "N/A",
-                        "Conexión": estado_conexion,
+                        "Conexión": "🔴 FALLA FÍSICA",
                         "Novedad Batería / Voltaje": texto_bateria,
-                        "Diagnóstico": diagnostico,
+                        "Diagnóstico": "Sin registros o equipo no configurado",
                         "WhatsApp": "",
                         "Observación": "",
                         "_timestamp": 0,
@@ -525,7 +440,7 @@ if btn_consultar:
             st.toast("✅ Consulta realizada con éxito.", icon="🎉")
 
         except Exception as e:
-            st.error(f"❌ Ocurrió un error inesperado al consultar Wialon: {e}")
+            st.error(f"❌ Ocurrió un error al consultar Wialon: {e}")
 
 # ==========================================
 # 8. VISUALIZACIÓN DE RESULTADOS
@@ -547,37 +462,23 @@ if "data_unidades" in st.session_state:
         num_rows="fixed",
         column_config={
             "Cliente / Grupo": st.column_config.TextColumn("Cliente / Grupo"),
-            "Días Sin Reporte": st.column_config.NumberColumn(
-                "Días Sin Reporte", format="%.1f días"
-            ),
+            "Días Sin Reporte": st.column_config.NumberColumn("Días Sin Reporte", format="%.1f días"),
             "Conexión": st.column_config.TextColumn("Conexión"),
-            "WhatsApp": st.column_config.TextColumn(
-                "WhatsApp (Ej: 584121234567)", help="Ingrese el número con código de país sin el signo +"
-            ),
-            "Observación": st.column_config.TextColumn(
-                "Observación / Notas", help="Escriba aquí los comentarios del caso"
-            ),
+            "WhatsApp": st.column_config.TextColumn("WhatsApp (Ej: 584121234567)"),
+            "Observación": st.column_config.TextColumn("Observación / Notas"),
         },
-    )
-
-    buffer_excel = generar_excel_reporte(edited_df)
-    st.download_button(
-        label="📥 Descargar Reporte Completo (Excel)",
-        data=buffer_excel,
-        file_name=f"Reporte_Diagnostico_Wialon_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
     st.divider()
 
     # ==========================================
-    # 9. GUARDAR HISTÓRICO Y SINCRONIZAR
+    # 9. GUARDAR Y DESCARGAR (SOLO 2 BOTONES)
     # ==========================================
-    st.subheader("💾 Registro Histórico de Observaciones y Reportes")
-    col_guardar_obs, col_subir_reporte, col_descargar_local = st.columns([1, 1, 1])
+    st.subheader("💾 Acciones del Registro")
+    col_guardar, col_descargar = st.columns(2)
 
-    with col_guardar_obs:
-        if st.button("💾 Guardar y Acumular en Google Drive"):
+    with col_guardar:
+        if st.button("☁️ Guardar y Acumular en Google Drive"):
             filas_con_obs = edited_df[
                 edited_df["Observación"].astype(str).str.strip().ne("")
                 & edited_df["Observación"].notna()
@@ -601,38 +502,29 @@ if "data_unidades" in st.session_state:
                 ]
                 df_nuevas = filas_con_obs[columnas_historial]
 
-                with st.spinner("☁️ Conectando con Google Drive y actualizando el historial..."):
-                    exito, mensaje, df_acumulado = sincronizar_excel_con_drive(df_nuevas)
+                with st.spinner("☁️ Actualizando historial en Google Drive..."):
+                    exito, mensaje, _ = sincronizar_excel_con_drive(df_nuevas)
                     if exito:
                         st.success(f"✅ {mensaje}")
                     else:
                         st.error(f"❌ {mensaje}")
 
-    with col_subir_reporte:
-        if st.button("📤 Guardar y Subir Reporte Completo a Google Drive"):
-            with st.spinner("☁️ Generando y subiendo archivo Excel a Google Drive..."):
-                exito_rep, msg_rep, _ = subir_reporte_a_drive(edited_df)
-                if exito_rep:
-                    st.success(f"✅ {msg_rep}")
-                else:
-                    st.error(f"❌ {msg_rep}")
-
-    with col_descargar_local:
-        if os.path.exists(EXCEL_HISTORIAL_PATH):
-            with open(EXCEL_HISTORIAL_PATH, "rb") as file_excel:
-                st.download_button(
-                    label="📥 Descargar Histórico Local (Excel)",
-                    data=file_excel,
-                    file_name="registro_observaciones_korban.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+    with col_descargar:
+        buffer_excel = generar_excel_reporte(edited_df)
+        st.download_button(
+            label="📥 Descargar Reporte Actual (Excel)",
+            data=buffer_excel,
+            file_name=f"Reporte_Diagnostico_Wialon_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
     st.divider()
 
     # ==========================================
     # 10. ENVÍO DE MENSAJES WHATSAPP
     # ==========================================
-    st.subheader("📲 Envío y Personalización de Alertas por WhatsApp")
+    st.subheader("📲 Envío de Alertas por WhatsApp")
 
     unidad_seleccionada = st.selectbox(
         "Selecciona la unidad para preparar la notificación:",
@@ -655,7 +547,7 @@ if "data_unidades" in st.session_state:
             mensaje_predeterminado += f"\n- Observación: {obs_text}"
 
         mensaje_editado = st.text_area(
-            "✏️ Puedes modificar el borrador del mensaje antes de enviarlo:",
+            "✏️ Borrador del mensaje:",
             value=mensaje_predeterminado,
             height=140,
         )
@@ -665,14 +557,11 @@ if "data_unidades" in st.session_state:
         col_info, col_btn_wa = st.columns([2, 1])
         with col_info:
             if not numero_wa or numero_wa == "nan":
-                st.warning(
-                    "⚠️ Escribe el número telefónico en la columna WhatsApp para"
-                    " habilitar el botón."
-                )
+                st.warning("⚠️ Ingresa el número telefónico en la tabla para enviar WhatsApp.")
             else:
                 st.info(f"📱 Número destino: **+{numero_wa}**")
 
         with col_btn_wa:
             if numero_wa and numero_wa != "nan":
                 link_wa = f"https://wa.me/{numero_wa}?text={msg_encoded}"
-                st.link_button("💬 Enviar WhatsApp Personalizado", link_wa)
+                st.link_button("💬 Enviar WhatsApp", link_wa)

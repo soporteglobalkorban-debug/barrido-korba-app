@@ -1,24 +1,110 @@
+import io
 import json
 import os
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 import requests
 import streamlit as st
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
-# 1. Configuración de página
+# ==========================================
+# 1. CONFIGURACIÓN DE PÁGINA
+# ==========================================
 st.set_page_config(
     page_title="Diagnóstico Wialon | Korban Global Solutions",
     page_icon="📡",
     layout="wide",
 )
 
-# 2. Obtener ruta absoluta del directorio del script (resuelve el problema del Logo)
+# ==========================================
+# 2. RUTAS Y CONSTANTES
+# ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(BASE_DIR, "logo.png")
 EXCEL_HISTORIAL_PATH = os.path.join(BASE_DIR, "registro_observaciones.xlsx")
+EXCEL_DRIVE_NAME = "registro_observaciones_korban.xlsx"
 
-# 3. Estilos CSS Personalizados
+# ==========================================
+# 3. FUNCIONES PARA GOOGLE DRIVE API
+# ==========================================
+def obtener_servicio_drive():
+    """Autentica y devuelve el servicio de Google Drive corrigiendo saltos de linea en TOML."""
+    if "gcp_service_account" not in st.secrets:
+        raise ValueError("No se encontraron las credenciales [gcp_service_account] en Streamlit Secrets.")
+    
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    
+    # Corrección clave para la lectura de private_key desde archivos TOML
+    if "private_key" in creds_dict and isinstance(creds_dict["private_key"], str):
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+        
+    credentials = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=credentials)
+
+def sincronizar_excel_con_drive(df_nuevo):
+    """Sube o actualiza el registro histórico en Google Drive con validación de ID."""
+    try:
+        drive_folder_id = st.secrets.get("DRIVE_FOLDER_ID", "COLOCA_AQUI_EL_ID_DE_LA_CARPETA_EN_DRIVE")
+        if not drive_folder_id or drive_folder_id == "COLOCA_AQUI_EL_ID_DE_LA_CARPETA_EN_DRIVE":
+            return False, "Falta configurar 'DRIVE_FOLDER_ID' en los Secrets de Streamlit."
+
+        service = obtener_servicio_drive()
+        
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df_nuevo.to_excel(writer, index=False, sheet_name="Observaciones")
+        buffer.seek(0)
+        
+        media = MediaIoBaseUpload(
+            buffer,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            resumable=False
+        )
+
+        query = f"'{drive_folder_id}' in parents and name = '{EXCEL_DRIVE_NAME}' and trashed = false"
+        results = service.files().list(
+            q=query, 
+            fields="files(id, name)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        
+        files = results.get("files", [])
+
+        if files:
+            file_id = files[0]["id"]
+            service.files().update(
+                fileId=file_id, 
+                media_body=media,
+                supportsAllDrives=True
+            ).execute()
+            return True, f"Archivo actualizado exitosamente en Google Drive."
+        else:
+            file_metadata = {
+                "name": EXCEL_DRIVE_NAME,
+                "parents": [drive_folder_id]
+            }
+            service.files().create(
+                body=file_metadata, 
+                media_body=media, 
+                fields="id",
+                supportsAllDrives=True
+            ).execute()
+            return True, f"Archivo nuevo creado exitosamente en Google Drive."
+            
+    except Exception as e:
+        return False, f"Error de Google Drive API: {str(e)}"
+
+# ==========================================
+# 4. ESTILOS CSS PERSONALIZADOS
+# ==========================================
 st.markdown(
     """
     <style>
@@ -48,7 +134,6 @@ st.markdown(
         background-color: #0f172a !important;
     }
     
-    /* Aplicar color blanco solo a textos descriptivos de la barra lateral, evitando romper iconos del sistema */
     [data-testid="stSidebar"] .stMarkdown, 
     [data-testid="stSidebar"] label, 
     [data-testid="stSidebar"] h1, 
@@ -57,7 +142,6 @@ st.markdown(
         color: #f1f5f9 !important;
     }
 
-    /* Ocultar texto crudo de iconos del sistema en barra lateral */
     [data-testid="stSidebarCollapseButton"] span {
         font-size: 0px !important;
     }
@@ -126,27 +210,28 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Encabezado con Logo y Título
+# ==========================================
+# 5. ENCABEZADO
+# ==========================================
 col_logo, col_titulo = st.columns([1, 4])
 
 with col_logo:
-  if os.path.exists(LOGO_PATH):
-    st.image(LOGO_PATH, width=190)
-  else:
-    st.caption("📷 *Guarda la imagen como 'logo.png' junto a app.py*")
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, width=190)
+    else:
+        st.caption("📷 *Guarda la imagen como 'logo.png' junto a app.py*")
 
 with col_titulo:
-  st.title("📡 Panel de Diagnóstico Wialon")
-  st.caption(
-      "Korban Global Solutions — Monitoreo ejecutivo de flotilla y gestión de"
-      " novedades"
-  )
+    st.title("📡 Panel de Diagnóstico Wialon")
+    st.caption("Korban Global Solutions — Monitoreo ejecutivo de flotilla y gestión de novedades")
 
 st.divider()
 
-# Barra lateral
+# ==========================================
+# 6. BARRA LATERAL
+# ==========================================
 if os.path.exists(LOGO_PATH):
-  st.sidebar.image(LOGO_PATH, use_container_width=True)
+    st.sidebar.image(LOGO_PATH, use_container_width=True)
 
 st.sidebar.header("⚙️ Parámetros de Conexión")
 token_input = st.sidebar.text_input(
@@ -156,333 +241,348 @@ token_input = st.sidebar.text_input(
 )
 horas_limite = st.sidebar.number_input("Horas sin reporte", value=48, step=12)
 
-if st.sidebar.button("🔍 Consultar Unidades"):
-  with st.spinner("Conectando con servidores Wialon y procesando estado..."):
-    try:
-      url = "https://hst-api.wialon.com/wialon/ajax.html"
+btn_consultar = st.sidebar.button("🔍 Consultar Unidades")
 
-      # Login
-      login_res = requests.get(
-          url,
-          params={
-              "svc": "token/login",
-              "params": json.dumps({"token": token_input}),
-          },
-          timeout=30,
-      ).json()
+# ==========================================
+# 7. CONSULTA Y PROCESAMIENTO API WIALON
+# ==========================================
+if btn_consultar:
+    with st.spinner("Conectando con servidores Wialon y procesando estado..."):
+        try:
+            url = "https://hst-api.wialon.com/wialon/ajax.html"
 
-      sid = login_res.get("eid") or (
-          login_res.get("session")
-          if isinstance(login_res.get("session"), str)
-          else None
-      )
-      if not sid and isinstance(login_res.get("session"), dict):
-        sid = login_res["session"].get("eid")
+            # 1. Login con validaciones de seguridad
+            res_login_req = requests.get(
+                url,
+                params={
+                    "svc": "token/login",
+                    "params": json.dumps({"token": token_input.strip()}),
+                },
+                timeout=30,
+            )
+            
+            login_res = res_login_req.json() if res_login_req is not None else None
 
-      if not sid:
-        st.error(f"Error de sesión: {login_res}")
-        st.stop()
+            if not login_res or not isinstance(login_res, dict) or "error" in login_res:
+                error_code = login_res.get("error") if isinstance(login_res, dict) else "Sin respuesta"
+                st.error(f"❌ Error de autenticación en Wialon (Código: {error_code}). Tu token venció o es inválido. Genera uno nuevo en Wialon.")
+                st.stop()
 
-      # Consultar Grupos
-      params_grupos = {
-          "spec": {
-              "itemsType": "avl_unit_group",
-              "propName": "sys_name",
-              "propValueMask": "*",
-              "sortType": "sys_name",
-          },
-          "force": 1,
-          "flags": 1,
-          "from": 0,
-          "to": 0,
-      }
-
-      res_grupos = requests.get(
-          url,
-          params={
-              "svc": "core/search_items",
-              "params": json.dumps(params_grupos),
-              "sid": sid,
-          },
-          timeout=30,
-      ).json()
-
-      mapa_grupos = {}
-      for grupo in res_grupos.get("items", []):
-        nombre_grupo = grupo.get("nm", "Sin Cliente")
-        u_ids = grupo.get("u", [])
-        if isinstance(u_ids, list):
-          for u_id in u_ids:
-            if u_id not in mapa_grupos:
-              mapa_grupos[u_id] = []
-            mapa_grupos[u_id].append(nombre_grupo)
-
-      # Consultar Unidades
-      flags_unidades = 1 + 1024 + 4096 + 1048576 + 2097152
-      params_unidades = {
-          "spec": {
-              "itemsType": "avl_unit",
-              "propName": "sys_name",
-              "propValueMask": "*",
-              "sortType": "sys_name",
-          },
-          "force": 1,
-          "flags": flags_unidades,
-          "from": 0,
-          "to": 0,
-      }
-
-      res = requests.get(
-          url,
-          params={
-              "svc": "core/search_items",
-              "params": json.dumps(params_unidades),
-              "sid": sid,
-          },
-          timeout=30,
-      ).json()
-      unidades = res.get("items", [])
-
-      ahora = datetime.now(timezone.utc)
-      limite = ahora - timedelta(hours=horas_limite)
-      data = []
-
-      for u in unidades:
-        u_id = u.get("id")
-        cliente_grupo = ", ".join(
-            mapa_grupos.get(u_id, ["Sin Grupo / General"])
-        )
-
-        lmsg = u.get("lmsg", {})
-        t = lmsg.get("t")
-
-        sensores = u.get("sens", {})
-        info_bateria = []
-        bateria_cero = False
-
-        if isinstance(sensores, dict):
-          sensores_list = sensores.values()
-        elif isinstance(sensores, list):
-          sensores_list = sensores
-        else:
-          sensores_list = []
-
-        for s in sensores_list:
-          nombre_sens = str(s.get("n", "")).strip()
-          if "bater" in nombre_sens.lower():
-            val = s.get("v")
-            if val is None and "p" in s:
-              param_key = s.get("p")
-              val = lmsg.get("p", {}).get(param_key, "N/A")
-
-            try:
-              val_num = float(val)
-              if val_num == 0:
-                bateria_cero = True
-                info_bateria.append(f"⚠️ {nombre_sens}: 0V")
-              else:
-                info_bateria.append(f"{nombre_sens}: {val_num:.1f}V")
-            except (ValueError, TypeError):
-              info_bateria.append(
-                  f"{nombre_sens}: {val if val is not None else 'Sin dato'}"
-              )
-
-        texto_bateria = (
-            " | ".join(info_bateria)
-            if info_bateria
-            else "Sin sensores de batería"
-        )
-
-        if not t:
-          estado_conexion = "🔴 FALLA FÍSICA"
-          diagnostico = "Sin registros o equipo no configurado"
-          data.append({
-              "Unidad": u.get("nm"),
-              "Cliente / Grupo": cliente_grupo,
-              "Último Reporte": "SIN DATOS",
-              "Días Sin Reporte": "N/A",
-              "Conexión": estado_conexion,
-              "Novedad Batería / Voltaje": texto_bateria,
-              "Diagnóstico": diagnostico,
-              "WhatsApp": "",
-              "Observación": "",
-              "_timestamp": 0,
-          })
-        else:
-          fecha_u = datetime.fromtimestamp(t, tz=timezone.utc)
-          if fecha_u <= limite:
-            dias_inactivo = round(
-                (ahora - fecha_u).total_seconds() / 86400, 1
+            sid = login_res.get("eid") or (
+                login_res.get("session")
+                if isinstance(login_res.get("session"), str)
+                else (login_res.get("session", {}).get("eid") if isinstance(login_res.get("session"), dict) else None)
             )
 
-            if bateria_cero:
-              estado_conexion = "🪫 SIN BATERÍA"
-              diagnostico = (
-                  f"Sensor en 0V. Inactivo por más de {horas_limite}h"
-              )
-            elif u.get("netconn"):
-              estado_conexion = "📶 SIN COBERTURA"
-              diagnostico = "Equipo encendido pero sin reporte GPS/GPRS"
-            else:
-              estado_conexion = "🔴 INACTIVO"
-              diagnostico = f"Sin comunicación por más de {horas_limite}h"
+            if not sid:
+                st.error("❌ No se pudo obtener la sesión (SID) de Wialon. Verifica la validez del token.")
+                st.stop()
 
-            data.append({
-                "Unidad": u.get("nm"),
-                "Cliente / Grupo": cliente_grupo,
-                "Último Reporte": fecha_u.strftime("%Y-%m-%d %H:%M:%S"),
-                "Días Sin Reporte": dias_inactivo,
-                "Conexión": estado_conexion,
-                "Novedad Batería / Voltaje": texto_bateria,
-                "Diagnóstico": diagnostico,
-                "WhatsApp": "",
-                "Observación": "",
-                "_timestamp": t,
-            })
+            # 2. Consultar Grupos
+            params_grupos = {
+                "spec": {
+                    "itemsType": "avl_unit_group",
+                    "propName": "sys_name",
+                    "propValueMask": "*",
+                    "sortType": "sys_name",
+                },
+                "force": 1,
+                "flags": 1,
+                "from": 0,
+                "to": 0,
+            }
 
-      df = pd.DataFrame(data)
-      if not df.empty:
-        df = df.sort_values(by="_timestamp", ascending=True)
-        df = df.drop(columns=["_timestamp"])
+            res_grupos_req = requests.get(
+                url,
+                params={
+                    "svc": "core/search_items",
+                    "params": json.dumps(params_grupos),
+                    "sid": sid,
+                },
+                timeout=30,
+            )
+            res_grupos = res_grupos_req.json() if res_grupos_req is not None else {}
 
-      st.session_state["data_unidades"] = df
-      st.session_state["total_evaluadas"] = len(unidades)
+            mapa_grupos = {}
+            for grupo in res_grupos.get("items", []) or []:
+                nombre_grupo = grupo.get("nm", "Sin Cliente")
+                u_ids = grupo.get("u", [])
+                if isinstance(u_ids, list):
+                    for u_id in u_ids:
+                        if u_id not in mapa_grupos:
+                            mapa_grupos[u_id] = []
+                        mapa_grupos[u_id].append(nombre_grupo)
 
-    except Exception as e:
-      st.error(f"Ocurrió un error inesperado: {e}")
+            # 3. Consultar Unidades
+            flags_unidades = 1 + 1024 + 4096 + 1048576 + 2097152
+            params_unidades = {
+                "spec": {
+                    "itemsType": "avl_unit",
+                    "propName": "sys_name",
+                    "propValueMask": "*",
+                    "sortType": "sys_name",
+                },
+                "force": 1,
+                "flags": flags_unidades,
+                "from": 0,
+                "to": 0,
+            }
 
-# Resultados
+            res_req = requests.get(
+                url,
+                params={
+                    "svc": "core/search_items",
+                    "params": json.dumps(params_unidades),
+                    "sid": sid,
+                },
+                timeout=30,
+            )
+            res = res_req.json() if res_req is not None else {}
+            unidades = res.get("items", []) or []
+
+            ahora = datetime.now(timezone.utc)
+            limite = ahora - timedelta(hours=horas_limite)
+            data = []
+
+            for u in unidades:
+                u_id = u.get("id")
+                cliente_grupo = ", ".join(mapa_grupos.get(u_id, ["Sin Grupo / General"]))
+
+                lmsg = u.get("lmsg") or {}
+                t = lmsg.get("t")
+
+                sensores = u.get("sens") or {}
+                info_bateria = []
+                bateria_cero = False
+
+                if isinstance(sensores, dict):
+                    sensores_list = sensores.values()
+                elif isinstance(sensores, list):
+                    sensores_list = sensores
+                else:
+                    sensores_list = []
+
+                for s in sensores_list:
+                    if not isinstance(s, dict):
+                        continue
+                    nombre_sens = str(s.get("n", "")).strip()
+                    if "bater" in nombre_sens.lower():
+                        val = s.get("v")
+                        if val is None and "p" in s:
+                            param_key = s.get("p")
+                            val = (lmsg.get("p") or {}).get(param_key, "N/A")
+
+                        try:
+                            val_num = float(val)
+                            if val_num == 0:
+                                bateria_cero = True
+                                info_bateria.append(f"⚠️ {nombre_sens}: 0V")
+                            else:
+                                info_bateria.append(f"{nombre_sens}: {val_num:.1f}V")
+                        except (ValueError, TypeError):
+                            info_bateria.append(f"{nombre_sens}: {val if val is not None else 'Sin dato'}")
+
+                texto_bateria = " | ".join(info_bateria) if info_bateria else "Sin sensores de batería"
+
+                if not t:
+                    estado_conexion = "🔴 FALLA FÍSICA"
+                    diagnostico = "Sin registros o equipo no configurado"
+                    data.append({
+                        "Unidad": u.get("nm"),
+                        "Cliente / Grupo": cliente_grupo,
+                        "Último Reporte": "SIN DATOS",
+                        "Días Sin Reporte": "N/A",
+                        "Conexión": estado_conexion,
+                        "Novedad Batería / Voltaje": texto_bateria,
+                        "Diagnóstico": diagnostico,
+                        "WhatsApp": "",
+                        "Observación": "",
+                        "_timestamp": 0,
+                    })
+                else:
+                    fecha_u = datetime.fromtimestamp(t, tz=timezone.utc)
+                    if fecha_u <= limite:
+                        dias_inactivo = round((ahora - fecha_u).total_seconds() / 86400, 1)
+
+                        if bateria_cero:
+                            estado_conexion = "🪫 SIN BATERÍA"
+                            diagnostico = f"Sensor en 0V. Inactivo por más de {horas_limite}h"
+                        elif u.get("netconn"):
+                            estado_conexion = "📶 SIN COBERTURA"
+                            diagnostico = "Equipo encendido pero sin reporte GPS/GPRS"
+                        else:
+                            estado_conexion = "🔴 INACTIVO"
+                            diagnostico = f"Sin comunicación por más de {horas_limite}h"
+
+                        data.append({
+                            "Unidad": u.get("nm"),
+                            "Cliente / Grupo": cliente_grupo,
+                            "Último Reporte": fecha_u.strftime("%Y-%m-%d %H:%M:%S"),
+                            "Días Sin Reporte": dias_inactivo,
+                            "Conexión": estado_conexion,
+                            "Novedad Batería / Voltaje": texto_bateria,
+                            "Diagnóstico": diagnostico,
+                            "WhatsApp": "",
+                            "Observación": "",
+                            "_timestamp": t,
+                        })
+
+            df = pd.DataFrame(data)
+            if not df.empty:
+                df = df.sort_values(by="_timestamp", ascending=True)
+                df = df.drop(columns=["_timestamp"])
+
+            st.session_state["data_unidades"] = df
+            st.session_state["total_evaluadas"] = len(unidades)
+            st.toast("✅ Diagnóstico completado con éxito.", icon="🎉")
+
+        except Exception as e:
+            st.error(f"❌ Ocurrió un error al consultar Wialon: {e}")
+
+# ==========================================
+# 8. VISUALIZACIÓN Y RESULTADOS
+# ==========================================
 if "data_unidades" in st.session_state:
-  df = st.session_state["data_unidades"]
+    df = st.session_state["data_unidades"]
 
-  col1, col2, col3 = st.columns(3)
-  col1.metric("Total Unidades Evaluadas", st.session_state["total_evaluadas"])
-  col2.metric("Unidades Críticas", len(df))
-  col3.metric("Filtro Aplicado", f">{horas_limite} Horas")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Unidades Evaluadas", st.session_state["total_evaluadas"])
+    col2.metric("Unidades Críticas", len(df))
+    col3.metric("Filtro Aplicado", f">{horas_limite} Horas")
 
-  st.write("")
-  st.subheader("📊 Listado de Unidades Críticas")
+    st.write("")
+    st.subheader("📊 Listado de Unidades Críticas")
 
-  edited_df = st.data_editor(
-      df,
-      use_container_width=True,
-      num_rows="fixed",
-      column_config={
-          "Cliente / Grupo": st.column_config.TextColumn("Cliente / Grupo"),
-          "Días Sin Reporte": st.column_config.NumberColumn(
-              "Días Sin Reporte", format="%.1f días"
-          ),
-          "Conexión": st.column_config.TextColumn("Conexión"),
-          "WhatsApp": st.column_config.TextColumn(
-              "WhatsApp (Ej: 584121234567)", help="Ingrese el número con código de país"
-          ),
-          "Observación": st.column_config.TextColumn(
-              "Observación / Notas", help="Escriba aquí los comentarios del caso"
-          ),
-      },
-  )
-
-  st.divider()
-
-  # Historial
-  st.subheader("💾 Registro Histórico de Observaciones")
-  col_guardar, col_descargar = st.columns([1, 1])
-
-  with col_guardar:
-    if st.button("💾 Guardar Observaciones en Excel"):
-      filas_con_obs = edited_df[
-          edited_df["Observación"].astype(str).str.strip().ne("")
-          & edited_df["Observación"].notna()
-      ].copy()
-
-      if filas_con_obs.empty:
-        st.warning("No hay observaciones escritas para guardar.")
-      else:
-        filas_con_obs["Fecha Registro"] = datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        columnas_historial = [
-            "Fecha Registro",
-            "Unidad",
-            "Cliente / Grupo",
-            "Conexión",
-            "Observación",
-            "Novedad Batería / Voltaje",
-            "WhatsApp",
-            "Último Reporte",
-            "Días Sin Reporte",
-            "Diagnóstico",
-        ]
-        df_guardar = filas_con_obs[columnas_historial]
-
-        try:
-          if os.path.exists(EXCEL_HISTORIAL_PATH):
-            df_existente = pd.read_excel(EXCEL_HISTORIAL_PATH)
-            df_final = pd.concat([df_existente, df_guardar], ignore_index=True)
-          else:
-            df_final = df_guardar
-
-          df_final.to_excel(EXCEL_HISTORIAL_PATH, index=False)
-          st.success(f"¡Se guardaron {len(df_guardar)} observación(es)!")
-        except Exception as ex:
-          st.error(
-              f"Error al guardar: {ex}. Cierra el archivo Excel si está abierto."
-          )
-
-  with col_descargar:
-    if os.path.exists(EXCEL_HISTORIAL_PATH):
-      with open(EXCEL_HISTORIAL_PATH, "rb") as file_excel:
-        st.download_button(
-            label="📥 Descargar Excel Histórico",
-            data=file_excel,
-            file_name="registro_observaciones_korban.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-  st.divider()
-
-  # WhatsApp
-  st.subheader("📲 Envío y Personalización de Alertas por WhatsApp")
-
-  unidad_seleccionada = st.selectbox(
-      "Selecciona la unidad para preparar la notificación:",
-      edited_df["Unidad"].tolist(),
-  )
-
-  if unidad_seleccionada:
-    fila = edited_df[edited_df["Unidad"] == unidad_seleccionada].iloc[0]
-    numero_wa = str(fila["WhatsApp"]).strip()
-    obs_text = str(fila["Observación"]).strip()
-
-    mensaje_predeterminado = (
-        f"Estimado cliente ({fila['Cliente / Grupo']}), de parte de Korban"
-        f" Global Solutions le informamos que la unidad *{fila['Unidad']}*"
-        f" presenta el siguiente estado: *{fila['Conexión']}*"
-        f" ({fila['Diagnóstico']}).\n\n- Último reporte:"
-        f" {fila['Último Reporte']} ({fila['Días Sin Reporte']} días)."
-    )
-    if obs_text and obs_text != "nan":
-      mensaje_predeterminado += f"\n- Observación: {obs_text}"
-
-    mensaje_editado = st.text_area(
-        "✏️ Puedes modificar el borrador del mensaje antes de enviarlo:",
-        value=mensaje_predeterminado,
-        height=140,
+    edited_df = st.data_editor(
+        df,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "Cliente / Grupo": st.column_config.TextColumn("Cliente / Grupo"),
+            "Días Sin Reporte": st.column_config.NumberColumn(
+                "Días Sin Reporte", format="%.1f días"
+            ),
+            "Conexión": st.column_config.TextColumn("Conexión"),
+            "WhatsApp": st.column_config.TextColumn(
+                "WhatsApp (Ej: 584121234567)", help="Ingrese el número con código de país sin el signo +"
+            ),
+            "Observación": st.column_config.TextColumn(
+                "Observación / Notas", help="Escriba aquí los comentarios del caso"
+            ),
+        },
     )
 
-    msg_encoded = urllib.parse.quote(mensaje_editado)
+    st.divider()
 
-    col_info, col_btn_wa = st.columns([2, 1])
-    with col_info:
-      if not numero_wa or numero_wa == "nan":
-        st.warning(
-            "⚠️ Escribe el número telefónico en la columna WhatsApp para"
-            " habilitar el botón."
+    # ==========================================
+    # 9. GUARDAR E HISTORIAL (LOCAL Y DRIVE)
+    # ==========================================
+    st.subheader("💾 Registro Histórico de Observaciones")
+    col_guardar, col_descargar = st.columns([1, 1])
+
+    with col_guardar:
+        if st.button("💾 Guardar y Sincronizar con Google Drive"):
+            filas_con_obs = edited_df[
+                edited_df["Observación"].astype(str).str.strip().ne("")
+                & edited_df["Observación"].notna()
+            ].copy()
+
+            if filas_con_obs.empty:
+                st.warning("⚠️ No hay observaciones escritas en la tabla para guardar.")
+            else:
+                filas_con_obs["Fecha Registro"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                columnas_historial = [
+                    "Fecha Registro",
+                    "Unidad",
+                    "Cliente / Grupo",
+                    "Conexión",
+                    "Observación",
+                    "Novedad Batería / Voltaje",
+                    "WhatsApp",
+                    "Último Reporte",
+                    "Días Sin Reporte",
+                    "Diagnóstico",
+                ]
+                df_guardar = filas_con_obs[columnas_historial]
+
+                # 1. Guardar copia local
+                try:
+                    if os.path.exists(EXCEL_HISTORIAL_PATH):
+                        df_existente = pd.read_excel(EXCEL_HISTORIAL_PATH)
+                        df_final = pd.concat([df_existente, df_guardar], ignore_index=True)
+                    else:
+                        df_final = df_guardar
+
+                    df_final.to_excel(EXCEL_HISTORIAL_PATH, index=False)
+                    st.success(f"✅ ¡Se guardaron {len(df_guardar)} observación(es) en el archivo local!")
+                except Exception as ex:
+                    st.error(f"❌ Error al guardar localmente: {ex}")
+                    df_final = df_guardar
+
+                # 2. Sincronizar automáticamente con Google Drive
+                with st.spinner("☁️ Sincronizando con Google Drive..."):
+                    exito_drive, mensaje_drive = sincronizar_excel_con_drive(df_final)
+                    if exito_drive:
+                        st.success(f"☁️ **Google Drive:** {mensaje_drive}")
+                    else:
+                        st.error(f"⚠️ {mensaje_drive}")
+
+    with col_descargar:
+        if os.path.exists(EXCEL_HISTORIAL_PATH):
+            with open(EXCEL_HISTORIAL_PATH, "rb") as file_excel:
+                st.download_button(
+                    label="📥 Descargar Excel Histórico Local",
+                    data=file_excel,
+                    file_name="registro_observaciones_korban.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+    st.divider()
+
+    # ==========================================
+    # 10. ENVÍO DE NOTIFICACIONES WHATSAPP
+    # ==========================================
+    st.subheader("📲 Envío y Personalización de Alertas por WhatsApp")
+
+    unidad_seleccionada = st.selectbox(
+        "Selecciona la unidad para preparar la notificación:",
+        edited_df["Unidad"].tolist(),
+    )
+
+    if unidad_seleccionada:
+        fila = edited_df[edited_df["Unidad"] == unidad_seleccionada].iloc[0]
+        numero_wa = str(fila["WhatsApp"]).strip()
+        obs_text = str(fila["Observación"]).strip()
+
+        mensaje_predeterminado = (
+            f"Estimado cliente ({fila['Cliente / Grupo']}), de parte de Korban"
+            f" Global Solutions le informamos que la unidad *{fila['Unidad']}*"
+            f" presenta el siguiente estado: *{fila['Conexión']}*"
+            f" ({fila['Diagnóstico']}).\n\n- Último reporte:"
+            f" {fila['Último Reporte']} ({fila['Días Sin Reporte']} días)."
         )
-      else:
-        st.info(f"📱 Número destino: **+{numero_wa}**")
+        if obs_text and obs_text != "nan":
+            mensaje_predeterminado += f"\n- Observación: {obs_text}"
 
-    with col_btn_wa:
-      if numero_wa and numero_wa != "nan":
-        link_wa = f"https://wa.me/{numero_wa}?text={msg_encoded}"
-        st.link_button("💬 Enviar WhatsApp Personalizado", link_wa)
+        mensaje_editado = st.text_area(
+            "✏️ Puedes modificar el borrador del mensaje antes de enviarlo:",
+            value=mensaje_predeterminado,
+            height=140,
+        )
+
+        msg_encoded = urllib.parse.quote(mensaje_editado)
+
+        col_info, col_btn_wa = st.columns([2, 1])
+        with col_info:
+            if not numero_wa or numero_wa == "nan":
+                st.warning(
+                    "⚠️ Escribe el número telefónico en la columna WhatsApp para"
+                    " habilitar el botón."
+                )
+            else:
+                st.info(f"📱 Número destino: **+{numero_wa}**")
+
+        with col_btn_wa:
+            if numero_wa and numero_wa != "nan":
+                link_wa = f"https://wa.me/{numero_wa}?text={msg_encoded}"
+                st.link_button("💬 Enviar WhatsApp Personalizado", link_wa)

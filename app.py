@@ -602,4 +602,3 @@ if "data_unidades" in st.session_state:
             if numero_wa and numero_wa != "nan":
                 link_wa = f"https://wa.me/{numero_wa}?text={msg_encoded}"
                 st.link_button("💬 Enviar WhatsApp Personalizado", link_wa)
-            

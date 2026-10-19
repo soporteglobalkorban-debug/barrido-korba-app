@@ -34,14 +34,15 @@ HISTORIAL_DRIVE_NAME = "registro_observaciones_korban.xlsx"
 WIALON_URL = "https://hst-api.wialon.com/wialon/ajax.html"
 
 COLUMNAS_DIAGNOSTICO = [
-    "Unidad", "Cliente / Grupo", "Último Reporte", "Días Sin Reporte",
-    "Estado", "Conexión", "Novedad Batería / Voltaje", "Diagnóstico",
-    "WhatsApp", "Observación",
+    "Unidad", "Cliente / Grupo", "Contacto", "Teléfono WhatsApp",
+    "Último Reporte", "Días Sin Reporte", "Estado", "Conexión",
+    "Novedad Batería / Voltaje", "Diagnóstico", "Observación",
 ]
 COLUMNAS_HISTORIAL = [
-    "Fecha Registro", "Unidad", "Cliente / Grupo", "Estado", "Conexión",
-    "Observación", "Novedad Batería / Voltaje", "WhatsApp",
-    "Último Reporte", "Días Sin Reporte", "Diagnóstico",
+    "Fecha Registro", "Unidad", "Cliente / Grupo", "Contacto",
+    "Teléfono WhatsApp", "Estado", "Conexión", "Observación",
+    "Novedad Batería / Voltaje", "Último Reporte", "Días Sin Reporte",
+    "Diagnóstico",
 ]
 
 # ============================================================
@@ -92,8 +93,45 @@ def wialon_call(servicio, parametros, sid=None):
     return resultado
 
 
+def normalizar_clave(texto):
+    """Normaliza nombres de campos para aceptar tildes y variantes comunes."""
+    import unicodedata
+    texto = unicodedata.normalize("NFKD", str(texto or ""))
+    return "".join(c for c in texto if not unicodedata.combining(c)).strip().lower()
+
+
+def extraer_campos_personalizados(grupo):
+    """Lee campos personalizados de un grupo; nunca devuelve contraseñas."""
+    campos = {}
+    flds = grupo.get("flds") or {}
+    valores = flds.values() if isinstance(flds, dict) else flds
+    for campo in valores:
+        if not isinstance(campo, dict):
+            continue
+        nombre = normalizar_clave(campo.get("n", ""))
+        valor = str(campo.get("v", "") or "").strip()
+        if nombre and valor:
+            # Excluir explícitamente datos de acceso/confidenciales.
+            if any(p in nombre for p in ("contrasena", "password", "clave", "token")):
+                continue
+            campos[nombre] = valor
+    return campos
+
+
+def limpiar_telefono(valor):
+    """Normaliza el teléfono para wa.me; agrega +57 a móviles colombianos de 10 dígitos."""
+    numero = "".join(c for c in str(valor or "") if c.isdigit())
+    # Los campos de contacto colombianos suelen guardar móviles locales (3XXXXXXXXX).
+    if len(numero) == 10 and numero.startswith("3"):
+        numero = "57" + numero
+    # Si se guardó como 057XXXXXXXXXX, se corrige al formato internacional esperado.
+    if len(numero) == 13 and numero.startswith("057"):
+        numero = numero[1:]
+    return numero
+
+
 def obtener_mapa_grupos(sid):
-    """Relaciona el ID de cada unidad con los grupos a los que pertenece."""
+    """Relaciona cada unidad con grupos, contacto y teléfono de sus campos personalizados."""
     resultado = wialon_call("core/search_items", {
         "spec": {
             "itemsType": "avl_unit_group",
@@ -102,16 +140,43 @@ def obtener_mapa_grupos(sid):
             "sortType": "sys_name",
         },
         "force": 1,
-        "flags": 1,
+        # Grupos: 1 = propiedades generales, 8 = campos personalizados.
+        "flags": 9,
         "from": 0,
         "to": 0,
     }, sid)
 
     mapa = {}
     for grupo in resultado.get("items", []) or []:
-        nombre = grupo.get("nm", "Sin nombre")
+        nombre_grupo = grupo.get("nm", "Sin nombre")
+        campos = extraer_campos_personalizados(grupo)
+        # Priorizar el campo específico de WhatsApp; usar Teléfono como respaldo.
+        telefono_raw = ""
+        for clave in ("telefono whatsapp", "whatsapp principal", "whatsapp", "telefono", "telefono de contacto"):
+            if campos.get(clave):
+                telefono_raw = campos[clave]
+                break
+        telefono = limpiar_telefono(telefono_raw)
+        contacto = ""
+        for clave in ("contacto responsable", "nombre y apellido", "nombre contacto", "contacto"):
+            if campos.get(clave):
+                contacto = campos[clave]
+                break
+        contacto = contacto or nombre_grupo
+
         for unidad_id in grupo.get("u", []) or []:
-            mapa.setdefault(unidad_id, []).append(nombre)
+            registro = mapa.setdefault(unidad_id, {"nombres": [], "contactos": [], "telefonos": []})
+            registro["nombres"].append(nombre_grupo)
+            if contacto and contacto not in registro["contactos"]:
+                registro["contactos"].append(contacto)
+            if telefono and telefono not in registro["telefonos"]:
+                registro["telefonos"].append(telefono)
+
+    for registro in mapa.values():
+        registro["contacto"] = " / ".join(registro["contactos"])
+        registro["telefono"] = registro["telefonos"][0] if len(registro["telefonos"]) == 1 else ""
+        registro["telefono_ambiguo"] = len(registro["telefonos"]) > 1
+        registro["nombres_texto"] = ", ".join(registro["nombres"])
     return mapa
 
 
@@ -196,7 +261,10 @@ def diagnosticar_unidades(unidades, mapa_grupos, horas_limite):
     for unidad in unidades:
         unidad_id = unidad.get("id")
         nombre = unidad.get("nm", f"Unidad {unidad_id}")
-        grupos = ", ".join(mapa_grupos.get(unidad_id, [])) or "Sin Grupo / General"
+        datos_grupo = mapa_grupos.get(unidad_id, {})
+        grupos = datos_grupo.get("nombres_texto", "") or "Sin Grupo / General"
+        contacto = datos_grupo.get("contacto", "") or "Sin contacto configurado"
+        telefono_whatsapp = datos_grupo.get("telefono", "")
         mensaje = unidad.get("lmsg") or {}
         timestamp = mensaje.get("t")
         sin_bateria, texto_bateria = analizar_bateria(unidad)
@@ -258,13 +326,14 @@ def diagnosticar_unidades(unidades, mapa_grupos, horas_limite):
         filas.append({
             "Unidad": nombre,
             "Cliente / Grupo": grupos,
+            "Contacto": contacto,
+            "Teléfono WhatsApp": telefono_whatsapp,
             "Último Reporte": ultimo_reporte,
             "Días Sin Reporte": dias_sin_reporte,
             "Estado": estado,
             "Conexión": conexion,
             "Novedad Batería / Voltaje": texto_bateria,
             "Diagnóstico": diagnostico,
-            "WhatsApp": "",
             "Observación": "",
             "_timestamp": float(timestamp or 0),
             "_inactiva": bool(supera_umbral),
@@ -596,16 +665,14 @@ else:
         hide_index=True,
         num_rows="fixed",
         disabled=[
-            "Unidad", "Cliente / Grupo", "Último Reporte", "Días Sin Reporte",
-            "Estado", "Conexión", "Novedad Batería / Voltaje", "Diagnóstico",
+            "Unidad", "Cliente / Grupo", "Contacto", "Teléfono WhatsApp",
+            "Último Reporte", "Días Sin Reporte", "Estado", "Conexión",
+            "Novedad Batería / Voltaje", "Diagnóstico",
         ],
         column_config={
-            "WhatsApp": st.column_config.TextColumn(
-                "WhatsApp (código de país + número, solo dígitos)"
-            ),
-            "Observación": st.column_config.TextColumn(
-                "Observación / seguimiento"
-            ),
+            "Contacto": st.column_config.TextColumn("Contacto leído del grupo Wialon"),
+            "Teléfono WhatsApp": st.column_config.TextColumn("Teléfono leído del grupo Wialon"),
+            "Observación": st.column_config.TextColumn("Observación / seguimiento"),
         },
     )
 
@@ -718,17 +785,18 @@ else:
             height=170,
             key="mensaje_whatsapp",
         )
-        numero = "".join(
-            caracter for caracter in str(fila["WhatsApp"]) if caracter.isdigit()
-        )
-
+        numero = limpiar_telefono(fila.get("Teléfono WhatsApp", ""))
+        contacto = str(fila.get("Contacto", "") or "").strip()
+        st.caption(f"Contacto detectado en el grupo: {contacto or 'No configurado'}")
         if numero and numero.lower() != "nan":
             enlace = f"https://wa.me/{numero}?text={urllib.parse.quote(mensaje)}"
             st.link_button("💬 Abrir WhatsApp con mensaje preparado", enlace)
         else:
             st.warning(
-                "Completa el número WhatsApp en la tabla. Incluye el código "
-                "de país, sin signo + ni espacios."
+                "No se puede preparar WhatsApp porque el grupo no tiene un teléfono "
+                "válido en sus campos personalizados, o la unidad pertenece a grupos "
+                "con números distintos. Revisa el campo 'Teléfono' o 'Teléfono WhatsApp' "
+                "del grupo en Wialon. Usa código de país y solo dígitos."
             )
     else:
         st.info("No hay unidades críticas que coincidan con los filtros actuales.")

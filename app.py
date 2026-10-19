@@ -84,13 +84,56 @@ def obtener_unidades(sid):
     }, sid)
     return result.get("items", []) or []
 
+
 def analizar_bateria(unidad):
     mensaje = unidad.get("lmsg") or {}
     parametros = mensaje.get("p") or {}
     sensores = unidad.get("sens") or {}
-    sensores = sensores.values() if isinstance(sensores, dict) else sensores if isinstance(sensores, list) else []
+
+    if isinstance(sensores, dict):
+        sensores = sensores.values()
+    elif not isinstance(sensores, list):
+        sensores = []
+
     encontrados = []
     sin_bateria = False
 
     for sensor in sensores:
         if not isinstance(sensor, dict):
+            continue
+
+        nombre = str(sensor.get("n", "")).strip()
+        nombre_lower = nombre.lower()
+
+        if not any(
+            palabra in nombre_lower
+            for palabra in ("bater", "volt", "power", "aliment")
+        ):
+            continue
+
+        valor = sensor.get("v")
+
+        if valor is None and sensor.get("p") is not None:
+            valor = parametros.get(sensor.get("p"))
+
+        if valor is None:
+            encontrados.append(f"{nombre}: sin dato")
+            continue
+
+        try:
+            numero = float(valor)
+            encontrados.append(f"{nombre}: {numero:g}")
+
+            if numero == 0:
+                sin_bateria = True
+
+        except (ValueError, TypeError):
+            encontrados.append(f"{nombre}: {valor}")
+
+    texto_bateria = (
+        " | ".join(encontrados)
+        if encontrados
+        else "Sin sensores de batería/voltaje configurados"
+    )
+
+    return sin_bateria, texto_bateria

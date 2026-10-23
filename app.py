@@ -181,8 +181,14 @@ def obtener_mapa_grupos(sid):
 
 
 def obtener_unidades(sid):
-    """Carga unidades con propiedades, sensores y último mensaje."""
-    flags = 1 + 1024 + 4096 + 1048576 + 2097152
+    """Carga unidades incluyendo propiedades avanzadas y creador.
+
+    El flag 256 es imprescindible para recibir ph/ph2/psw (teléfonos y
+    contraseña de comunicación). El flag 4 devuelve crt (ID del creador).
+    Los flags de sensores, último mensaje, parámetros y conexión se mantienen
+    para no afectar el panel de diagnóstico.
+    """
+    flags = 1 + 4 + 256 + 1024 + 4096 + 1048576 + 2097152
     resultado = wialon_call("core/search_items", {
         "spec": {
             "itemsType": "avl_unit",
@@ -235,10 +241,11 @@ def construir_reporte_sim(unidades, mapa_creadores):
         creador = mapa_creadores.get(str(creador_id), "") if creador_id not in (None, "") else ""
         if not creador and creador_id not in (None, ""):
             creador = str(creador_id)
-        # En Wialon, ph y ps corresponden habitualmente al teléfono y contraseña
-        # configurados en las propiedades básicas de la unidad.
+        # Según el formato oficial de Wialon, las propiedades avanzadas son:
+        # ph = teléfono, ph2 = teléfono secundario y psw = contraseña.
+        # La contraseña NO se llama "ps" en la respuesta de esta API.
         telefono = str(unidad.get("ph") or "").strip()
-        contrasena = str(unidad.get("ps") or "").strip()
+        contrasena = str(unidad.get("psw") or unidad.get("ps") or "").strip()
         filas.append({
             "Placa": str(unidad.get("nm") or "").strip(),
             "Creador": creador or "No disponible",
@@ -715,7 +722,7 @@ else:
                         st.warning("Escribe al menos una observación antes de guardar.")
                 except Exception as error:
                     st.error(f"No se pudieron guardar las observaciones SIM: {error}")
-        st.caption("La contraseña se lee desde la propiedad básica de la unidad (campo de API `ps`). Si un campo aparece vacío, verifica los permisos y que Wialon lo entregue al token utilizado.")
+        st.caption("Los datos se leen de las propiedades avanzadas de la unidad: `ph` (teléfono) y `psw` (contraseña), y de las propiedades de facturación `crt` (creador). Si algún campo aparece vacío, revisa los permisos de conectividad del token en Wialon y confirma que el dato esté configurado en la unidad.")
     else:
         st.info("Pulsa **Consultar todas las unidades para inventario SIM** para cargar la pantalla.")
 
@@ -871,7 +878,9 @@ if st.session_state["pantalla"] == "diagnostico":
         with b2:
             st.download_button(
                 "📥 Descargar diagnóstico Excel",
-                data=generar_excel(vista_editor),
+                # Exportar el resultado del editor, no el dataframe original:
+                # así se incluyen las observaciones recién escritas en pantalla.
+                data=generar_excel(editor, "Diagnostico_Wialon"),
                 file_name=f"Diagnostico_Wialon_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,

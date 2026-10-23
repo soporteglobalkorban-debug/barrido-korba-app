@@ -263,6 +263,7 @@ def guardar_observaciones_sim(df):
     filas = df[df["Observación"].fillna("").astype(str).str.strip().ne("")].copy()
     if filas.empty:
         return 0
+    cantidad_nueva = len(filas)
     filas.insert(0, "Fecha Registro", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"))
     if os.path.exists(ruta):
         try:
@@ -271,7 +272,7 @@ def guardar_observaciones_sim(df):
             anterior = pd.DataFrame()
         filas = pd.concat([anterior, filas], ignore_index=True)
     filas.to_excel(ruta, index=False)
-    return len(filas)
+    return cantidad_nueva
 
 
 def analizar_bateria(unidad):
@@ -703,11 +704,20 @@ else:
                 "Observación": st.column_config.TextColumn("Observación / cotejo con proveedor", width="large"),
             },
         )
+        # Persistir la versión devuelta por data_editor antes de crear el Excel.
+        # Así el siguiente rerun (por ejemplo al pulsar Descargar) parte de las
+        # observaciones editadas y no del DataFrame inicial del barrido.
+        sim_editado = sim_editado.reindex(columns=columnas_sim).copy()
+        sim_editado["Observación"] = sim_editado["Observación"].fillna("").astype(str)
+        st.session_state["df_sim"] = sim_editado.copy()
         a1, a2 = st.columns(2)
         with a1:
             st.download_button(
                 "📥 Descargar inventario SIM en Excel",
-                data=generar_excel(sim_editado, "Inventario_SIM"),
+                data=generar_excel(
+                    st.session_state["df_sim"].reindex(columns=columnas_sim),
+                    "Inventario_SIM",
+                ),
                 file_name=f"Inventario_SIM_Wialon_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,

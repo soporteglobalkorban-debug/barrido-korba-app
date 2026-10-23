@@ -198,6 +198,75 @@ def obtener_unidades(sid):
     return resultado.get("items", []) or []
 
 
+def obtener_mapa_creadores(sid):
+    """Resuelve el ID del creador a su nombre cuando el token tiene permisos."""
+    try:
+        resultado = wialon_call("core/search_items", {
+            "spec": {
+                "itemsType": "user",
+                "propName": "sys_name",
+                "propValueMask": "*",
+                "sortType": "sys_name",
+            },
+            "force": 1,
+            "flags": 1,
+            "from": 0,
+            "to": 0,
+        }, sid)
+        mapa = {}
+        for usuario in resultado.get("items", []) or []:
+            if not isinstance(usuario, dict):
+                continue
+            uid = usuario.get("id")
+            nombre = usuario.get("nm") or usuario.get("name")
+            if uid is not None and nombre:
+                mapa[str(uid)] = str(nombre)
+        return mapa
+    except Exception:
+        # El barrido SIM debe seguir funcionando si el token no puede leer usuarios.
+        return {}
+
+
+def construir_reporte_sim(unidades, mapa_creadores):
+    """Construye el inventario de SIM desde propiedades generales de cada unidad."""
+    filas = []
+    for unidad in unidades:
+        creador_id = unidad.get("crt", unidad.get("creator", ""))
+        creador = mapa_creadores.get(str(creador_id), "") if creador_id not in (None, "") else ""
+        if not creador and creador_id not in (None, ""):
+            creador = str(creador_id)
+        # En Wialon, ph y ps corresponden habitualmente al teléfono y contraseña
+        # configurados en las propiedades básicas de la unidad.
+        telefono = str(unidad.get("ph") or "").strip()
+        contrasena = str(unidad.get("ps") or "").strip()
+        filas.append({
+            "Placa": str(unidad.get("nm") or "").strip(),
+            "Creador": creador or "No disponible",
+            "Número de teléfono (SIM)": telefono,
+            "Contraseña": contrasena,
+            "Observación": "",
+        })
+    columnas = ["Placa", "Creador", "Número de teléfono (SIM)", "Contraseña", "Observación"]
+    return pd.DataFrame(filas, columns=columnas).sort_values("Placa", na_position="last").reset_index(drop=True)
+
+
+def guardar_observaciones_sim(df):
+    """Acumula localmente las observaciones del inventario SIM."""
+    ruta = os.path.join(BASE_DIR, "observaciones_barrido_sim.xlsx")
+    filas = df[df["Observación"].fillna("").astype(str).str.strip().ne("")].copy()
+    if filas.empty:
+        return 0
+    filas.insert(0, "Fecha Registro", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+    if os.path.exists(ruta):
+        try:
+            anterior = pd.read_excel(ruta)
+        except Exception:
+            anterior = pd.DataFrame()
+        filas = pd.concat([anterior, filas], ignore_index=True)
+    filas.to_excel(ruta, index=False)
+    return len(filas)
+
+
 def analizar_bateria(unidad):
     """
     Lee sensores cuyo nombre menciona batería, voltaje, alimentación o power.
@@ -502,311 +571,402 @@ else:
 st.divider()
 
 # ============================================================
-# 6. BARRA LATERAL
+# 6. NAVEGACIÓN Y BARRA LATERAL
 # ============================================================
+if "pantalla" not in st.session_state:
+    st.session_state["pantalla"] = "diagnostico"
+
 with st.sidebar:
     if os.path.exists(LOGO_PATH):
         st.image(LOGO_PATH, use_container_width=True)
+    st.header("🧭 Módulos")
+    if st.button("📡 Diagnóstico de unidades", use_container_width=True):
+        st.session_state["pantalla"] = "diagnostico"
+    if st.button("📱 Barrido de SIM", use_container_width=True):
+        st.session_state["pantalla"] = "sim"
+    st.divider()
     st.header("⚙️ Parámetros de conexión")
     token = st.text_input(
         "Token de Wialon",
         type="password",
         help="Pega aquí un token vigente. No lo escribas directamente en el código.",
-    )
-    horas_limite = st.number_input(
-        "Horas sin reporte",
-        min_value=1,
-        max_value=720,
-        value=48,
-        step=12,
-    )
-    st.caption("El umbral se calcula usando la fecha del último mensaje recibido.")
-    consultar = st.button("🔍 Ejecutar barrido", use_container_width=True)
-
-if consultar:
-    if not token.strip():
-        st.error("Introduce tu token de Wialon en la barra lateral.")
-    else:
-        sid = None
-        try:
-            with st.spinner("Conectando con Wialon y analizando las unidades..."):
-                login = wialon_call("token/login", {"token": token.strip()})
-                sid = login.get("eid")
-                if not sid:
-                    raise RuntimeError("Wialon no devolvió el identificador de sesión.")
-
-                mapa_grupos = obtener_mapa_grupos(sid)
-                unidades = obtener_unidades(sid)
-                if not unidades:
-                    raise RuntimeError(
-                        "La API no devolvió unidades. Revisa permisos del token."
-                    )
-
-                df_resultado = diagnosticar_unidades(
-                    unidades, mapa_grupos, int(horas_limite)
-                )
-                st.session_state["df_completo"] = df_resultado
-                st.session_state["total_unidades"] = len(unidades)
-                st.session_state["fecha_barrido"] = datetime.now().astimezone().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                st.session_state["horas_limite_usadas"] = int(horas_limite)
-        except Exception as error:
-            st.error(f"No se pudo completar el barrido: {error}")
-        finally:
-            if sid:
-                try:
-                    wialon_call("core/logout", {}, sid)
-                except Exception:
-                    pass
-
-# ============================================================
-# 7. DASHBOARD Y DIAGNÓSTICO
-# ============================================================
-if "df_completo" not in st.session_state:
-    st.info(
-        "Introduce el token de Wialon en la barra lateral y pulsa "
-        "**Ejecutar barrido** para cargar el dashboard."
-    )
-else:
-    df_all = st.session_state["df_completo"].copy()
-    umbral_actual = st.session_state.get("horas_limite_usadas", int(horas_limite))
-    criticos = df_all[df_all["_inactiva"]].copy()
-
-    total = len(df_all)
-    sin_bateria = int(df_all["_sin_bateria"].sum())
-    conectadas = int(df_all["_conectado"].sum())
-    sin_conexion = total - conectadas
-    sin_reporte = int(df_all["_inactiva"].sum())
-
-    st.caption(
-        f"Último barrido: {st.session_state['fecha_barrido']} · "
-        f"Umbral utilizado: {umbral_actual} horas"
-    )
-    st.subheader("📊 Dashboard general de flota")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Unidades evaluadas", total)
-    c2.metric("Sin batería*", sin_bateria)
-    c3.metric("Con conexión Wialon", conectadas)
-    c4.metric("Sin conexión Wialon", sin_conexion)
-    c5.metric("Sin reporte en el umbral", sin_reporte)
-
-    st.caption(
-        "*“Sin batería” se cuenta solo cuando un sensor configurado de batería/"
-        "voltaje devuelve exactamente 0. Con/sin conexión usa el indicador "
-        "netconn de Wialon; no confirma por sí solo si el motor está encendido. "
-        "Para el estado real del motor debe validarse un sensor IGN/RPM."
+        key="token_wialon",
     )
 
-    with st.expander("📈 Distribución de unidades", expanded=False):
-        grafico = pd.DataFrame({
-            "Categoría": [
-                "Sin batería (sensor en 0)",
-                "Con conexión Wialon",
-                "Sin conexión Wialon",
-                "Sin reporte según umbral",
-            ],
-            "Cantidad": [sin_bateria, conectadas, sin_conexion, sin_reporte],
-        }).set_index("Categoría")
-        st.bar_chart(grafico)
-
-    st.divider()
-    st.subheader("🧰 Diagnóstico de unidades sin reporte")
-    f1, f2, f3 = st.columns([2, 1, 1])
-    with f1:
-        buscar = st.text_input(
-            "Buscar unidad o cliente",
-            placeholder="Escribe nombre de unidad o cliente...",
+if st.session_state["pantalla"] == "diagnostico":
+    with st.sidebar:
+        horas_limite = st.number_input(
+            "Horas sin reporte",
+            min_value=1,
+            max_value=720,
+            value=48,
+            step=12,
         )
-    with f2:
-        filtro_estado = st.selectbox(
-            "Estado",
-            [
-                "Todos",
-                "SIN BATERÍA (sensor 0)",
-                "SIN DATOS",
-                "ENCENDIDO / CONECTADO",
-                "APAGADO / SIN CONEXIÓN",
-            ],
-        )
-    with f3:
-        ordenar = st.selectbox(
-            "Ordenar por",
-            ["Más días sin reporte", "Unidad", "Cliente / Grupo"],
-        )
+        st.caption("El umbral se calcula usando la fecha del último mensaje recibido.")
+        consultar = st.button("🔍 Ejecutar barrido", use_container_width=True)
 
-    vista = criticos.copy()
-    if buscar.strip():
-        buscar_mask = (
-            vista["Unidad"].astype(str).str.contains(buscar, case=False, na=False)
-            | vista["Cliente / Grupo"].astype(str).str.contains(
-                buscar, case=False, na=False
-            )
-        )
-        vista = vista[buscar_mask]
-    if filtro_estado != "Todos":
-        vista = vista[vista["Estado"] == filtro_estado]
-
-    if ordenar == "Más días sin reporte":
-        vista["_dias_num"] = pd.to_numeric(vista["Días Sin Reporte"], errors="coerce")
-        vista = vista.sort_values("_dias_num", ascending=False, na_position="first")
-    else:
-        vista = vista.sort_values(ordenar, na_position="last")
-
-    st.info(
-        f"Se muestran {len(vista)} unidad(es) que superan el umbral "
-        f"de {umbral_actual} horas."
-    )
-    vista_editor = vista[COLUMNAS_DIAGNOSTICO].copy()
-    editor = st.data_editor(
-        vista_editor,
-        key="editor_diagnostico",
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        disabled=[
-            "Unidad", "Cliente / Grupo", "Contacto", "Teléfono WhatsApp",
-            "Último Reporte", "Días Sin Reporte", "Estado", "Conexión",
-            "Novedad Batería / Voltaje", "Diagnóstico",
-        ],
-        column_config={
-            "Contacto": st.column_config.TextColumn("Contacto leído del grupo Wialon"),
-            "Teléfono WhatsApp": st.column_config.TextColumn("Teléfono leído del grupo Wialon"),
-            "Observación": st.column_config.TextColumn("Observación / seguimiento"),
-        },
-    )
-
-    # ========================================================
-    # 8. GUARDAR, DESCARGAR Y SINCRONIZAR
-    # ========================================================
-    st.divider()
-    st.subheader("💾 Acciones del registro")
-    b1, b2, b3 = st.columns(3)
-
-    with b1:
-        if st.button(
-            "💾 Guardar observaciones",
-            use_container_width=True,
-            disabled=editor.empty,
-        ):
-            observadas = editor[
-                editor["Observación"].fillna("").astype(str).str.strip().ne("")
-            ].copy()
-            if observadas.empty:
-                st.warning("Escribe al menos una observación antes de guardar.")
-            else:
-                observadas["Fecha Registro"] = datetime.now().astimezone().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                nuevas = observadas[COLUMNAS_HISTORIAL]
-                try:
-                    cantidad = guardar_historico_local(nuevas)
-                    st.success(
-                        f"Se guardaron {len(nuevas)} observaciones. "
-                        f"Total acumulado local: {cantidad}."
-                    )
-                except Exception as error:
-                    st.error(f"No se pudo guardar el histórico local: {error}")
-
-    with b2:
-        st.download_button(
-            "📥 Descargar diagnóstico Excel",
-            data=generar_excel(vista_editor),
-            file_name=f"Diagnostico_Wialon_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-    with b3:
-        if st.button("☁️ Guardar observaciones en Google Drive", use_container_width=True):
-            observadas = editor[
-                editor["Observación"].fillna("").astype(str).str.strip().ne("")
-            ].copy()
-            if observadas.empty:
-                st.warning("Escribe al menos una observación antes de sincronizar.")
-            else:
-                observadas["Fecha Registro"] = datetime.now().astimezone().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                nuevas = observadas[COLUMNAS_HISTORIAL]
-                try:
-                    with st.spinner("Sincronizando con Google Drive..."):
-                        cantidad = sincronizar_historico_drive(nuevas)
-                    st.success(
-                        f"Google Drive actualizado. Registros acumulados: {cantidad}."
-                    )
-                except Exception as error:
-                    st.error(f"No se pudo sincronizar con Google Drive: {error}")
-
-    if os.path.exists(HISTORIAL_LOCAL_PATH):
-        with open(HISTORIAL_LOCAL_PATH, "rb") as archivo:
-            st.download_button(
-                "📚 Descargar histórico local acumulado",
-                data=archivo.read(),
-                file_name="registro_observaciones.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-    st.caption(
-        "Nota: el almacenamiento local de Streamlit Community Cloud puede ser "
-        "efímero. Para conservar el histórico entre reinicios, configura Google Drive."
-    )
-
-    # ========================================================
-    # 9. WHATSAPP
-    # ========================================================
-    st.divider()
-    st.subheader("📲 Preparar aviso por WhatsApp")
-
-    if not editor.empty:
-        opciones = [
-            f"{fila['Unidad']} — {fila['Cliente / Grupo']}"
-            for _, fila in editor.iterrows()
-        ]
-        seleccion = st.selectbox("Selecciona la unidad", opciones)
-        posicion = opciones.index(seleccion)
-        fila = editor.iloc[posicion]
-
-        observacion = str(fila["Observación"]).strip()
-        mensaje_default = (
-            f"Estimado cliente ({fila['Cliente / Grupo']}), desde Korban Global "
-            f"Solutions le informamos que la unidad {fila['Unidad']} presenta "
-            f"la siguiente novedad: {fila['Conexión']}. "
-            f"Diagnóstico: {fila['Diagnóstico']}\n\n"
-            f"Último reporte: {fila['Último Reporte']}.\n"
-            f"Tiempo sin reporte: {fila['Días Sin Reporte']} días.\n"
-            f"Batería/voltaje: {fila['Novedad Batería / Voltaje']}."
-        )
-        if observacion and observacion.lower() != "nan":
-            mensaje_default += f"\nObservación de soporte: {observacion}"
-
-        mensaje = st.text_area(
-            "Editar mensaje antes de abrir WhatsApp",
-            value=mensaje_default,
-            height=170,
-            key="mensaje_whatsapp",
-        )
-        numero = limpiar_telefono(fila.get("Teléfono WhatsApp", ""))
-        contacto = str(fila.get("Contacto", "") or "").strip()
-        st.caption(f"Contacto detectado en el grupo: {contacto or 'No configurado'}")
-        if numero and numero.lower() != "nan":
-            enlace = f"https://wa.me/{numero}?text={urllib.parse.quote(mensaje)}"
-            st.link_button("💬 Abrir WhatsApp con mensaje preparado", enlace)
+    if consultar:
+        if not token.strip():
+            st.error("Introduce tu token de Wialon en la barra lateral.")
         else:
-            st.warning(
-                "No se puede preparar WhatsApp porque el grupo no tiene un teléfono "
-                "válido en sus campos personalizados, o la unidad pertenece a grupos "
-                "con números distintos. Revisa el campo 'Teléfono' o 'Teléfono WhatsApp' "
-                "del grupo en Wialon. Usa código de país y solo dígitos."
-            )
-    else:
-        st.info("No hay unidades críticas que coincidan con los filtros actuales.")
+            sid = None
+            try:
+                with st.spinner("Conectando con Wialon y analizando las unidades..."):
+                    login = wialon_call("token/login", {"token": token.strip()})
+                    sid = login.get("eid")
+                    if not sid:
+                        raise RuntimeError("Wialon no devolvió el identificador de sesión.")
 
-    # ========================================================
-    # 10. TODAS LAS UNIDADES
-    # ========================================================
-    with st.expander("🔎 Ver todas las unidades evaluadas"):
-        st.dataframe(
-            df_all[COLUMNAS_DIAGNOSTICO],
+                    mapa_grupos = obtener_mapa_grupos(sid)
+                    unidades = obtener_unidades(sid)
+                    if not unidades:
+                        raise RuntimeError(
+                            "La API no devolvió unidades. Revisa permisos del token."
+                        )
+
+                    df_resultado = diagnosticar_unidades(
+                        unidades, mapa_grupos, int(horas_limite)
+                    )
+                    st.session_state["df_completo"] = df_resultado
+                    st.session_state["total_unidades"] = len(unidades)
+                    st.session_state["fecha_barrido"] = datetime.now().astimezone().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    st.session_state["horas_limite_usadas"] = int(horas_limite)
+            except Exception as error:
+                st.error(f"No se pudo completar el barrido: {error}")
+            finally:
+                if sid:
+                    try:
+                        wialon_call("core/logout", {}, sid)
+                    except Exception:
+                        pass
+else:
+    st.title("📱 Barrido de SIM")
+    st.caption("Inventario de teléfonos y contraseñas configurados en las propiedades básicas de las unidades Wialon.")
+    st.warning("El Excel incluye contraseñas de las unidades. Guárdalo en una ubicación restringida y compártelo solo con personal autorizado.")
+    if st.button("🔎 Consultar todas las unidades para inventario SIM", type="primary", use_container_width=True):
+        if not token.strip():
+            st.error("Introduce tu token de Wialon en la barra lateral.")
+        else:
+            sid = None
+            try:
+                with st.spinner("Leyendo unidades y propiedades de SIM desde Wialon..."):
+                    login = wialon_call("token/login", {"token": token.strip()})
+                    sid = login.get("eid")
+                    if not sid:
+                        raise RuntimeError("Wialon no devolvió el identificador de sesión.")
+                    unidades_sim = obtener_unidades(sid)
+                    if not unidades_sim:
+                        raise RuntimeError("La API no devolvió unidades. Revisa los permisos del token.")
+                    creadores = obtener_mapa_creadores(sid)
+                    df_sim = construir_reporte_sim(unidades_sim, creadores)
+                    st.session_state["df_sim"] = df_sim
+                    st.session_state["fecha_barrido_sim"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            except Exception as error:
+                st.error(f"No se pudo completar el barrido SIM: {error}")
+            finally:
+                if sid:
+                    try:
+                        wialon_call("core/logout", {}, sid)
+                    except Exception:
+                        pass
+
+    if "df_sim" in st.session_state:
+        df_sim = st.session_state["df_sim"].copy()
+        st.caption(f"Último barrido SIM: {st.session_state.get('fecha_barrido_sim', 'N/A')}")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Unidades leídas", len(df_sim))
+        m2.metric("Con número SIM", int(df_sim["Número de teléfono (SIM)"].fillna("").astype(str).str.strip().ne("").sum()))
+        m3.metric("Sin número SIM", int(df_sim["Número de teléfono (SIM)"].fillna("").astype(str).str.strip().eq("").sum()))
+        st.info("Revisa el número y la contraseña contra el archivo del proveedor. Puedes escribir notas en Observación antes de exportar.")
+        columnas_sim = ["Placa", "Creador", "Número de teléfono (SIM)", "Contraseña", "Observación"]
+        sim_editado = st.data_editor(
+            df_sim[columnas_sim],
+            key="editor_barrido_sim",
             use_container_width=True,
             hide_index=True,
+            num_rows="fixed",
+            disabled=["Placa", "Creador", "Número de teléfono (SIM)", "Contraseña"],
+            column_config={
+                "Placa": st.column_config.TextColumn("Placa / nombre de unidad"),
+                "Creador": st.column_config.TextColumn("Creador de la unidad"),
+                "Número de teléfono (SIM)": st.column_config.TextColumn("Número de teléfono SIM"),
+                "Contraseña": st.column_config.TextColumn("Contraseña configurada en Wialon"),
+                "Observación": st.column_config.TextColumn("Observación / cotejo con proveedor", width="large"),
+            },
         )
+        a1, a2 = st.columns(2)
+        with a1:
+            st.download_button(
+                "📥 Descargar inventario SIM en Excel",
+                data=generar_excel(sim_editado, "Inventario_SIM"),
+                file_name=f"Inventario_SIM_Wialon_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with a2:
+            if st.button("💾 Guardar observaciones SIM", use_container_width=True):
+                try:
+                    cantidad = guardar_observaciones_sim(sim_editado)
+                    if cantidad:
+                        st.success(f"Observaciones guardadas. Registros acumulados: {cantidad}.")
+                    else:
+                        st.warning("Escribe al menos una observación antes de guardar.")
+                except Exception as error:
+                    st.error(f"No se pudieron guardar las observaciones SIM: {error}")
+        st.caption("La contraseña se lee desde la propiedad básica de la unidad (campo de API `ps`). Si un campo aparece vacío, verifica los permisos y que Wialon lo entregue al token utilizado.")
+    else:
+        st.info("Pulsa **Consultar todas las unidades para inventario SIM** para cargar la pantalla.")
+
+if st.session_state["pantalla"] == "diagnostico":
+    # ============================================================
+    # 7. DASHBOARD Y DIAGNÓSTICO
+    # ============================================================
+    if "df_completo" not in st.session_state:
+        st.info(
+            "Introduce el token de Wialon en la barra lateral y pulsa "
+            "**Ejecutar barrido** para cargar el dashboard."
+        )
+    else:
+        df_all = st.session_state["df_completo"].copy()
+        umbral_actual = st.session_state.get("horas_limite_usadas", int(horas_limite))
+        criticos = df_all[df_all["_inactiva"]].copy()
+
+        total = len(df_all)
+        sin_bateria = int(df_all["_sin_bateria"].sum())
+        conectadas = int(df_all["_conectado"].sum())
+        sin_conexion = total - conectadas
+        sin_reporte = int(df_all["_inactiva"].sum())
+
+        st.caption(
+            f"Último barrido: {st.session_state['fecha_barrido']} · "
+            f"Umbral utilizado: {umbral_actual} horas"
+        )
+        st.subheader("📊 Dashboard general de flota")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Unidades evaluadas", total)
+        c2.metric("Sin batería*", sin_bateria)
+        c3.metric("Con conexión Wialon", conectadas)
+        c4.metric("Sin conexión Wialon", sin_conexion)
+        c5.metric("Sin reporte en el umbral", sin_reporte)
+
+        st.caption(
+            "*“Sin batería” se cuenta solo cuando un sensor configurado de batería/"
+            "voltaje devuelve exactamente 0. Con/sin conexión usa el indicador "
+            "netconn de Wialon; no confirma por sí solo si el motor está encendido. "
+            "Para el estado real del motor debe validarse un sensor IGN/RPM."
+        )
+
+        with st.expander("📈 Distribución de unidades", expanded=False):
+            grafico = pd.DataFrame({
+                "Categoría": [
+                    "Sin batería (sensor en 0)",
+                    "Con conexión Wialon",
+                    "Sin conexión Wialon",
+                    "Sin reporte según umbral",
+                ],
+                "Cantidad": [sin_bateria, conectadas, sin_conexion, sin_reporte],
+            }).set_index("Categoría")
+            st.bar_chart(grafico)
+
+        st.divider()
+        st.subheader("🧰 Diagnóstico de unidades sin reporte")
+        f1, f2, f3 = st.columns([2, 1, 1])
+        with f1:
+            buscar = st.text_input(
+                "Buscar unidad o cliente",
+                placeholder="Escribe nombre de unidad o cliente...",
+            )
+        with f2:
+            filtro_estado = st.selectbox(
+                "Estado",
+                [
+                    "Todos",
+                    "SIN BATERÍA (sensor 0)",
+                    "SIN DATOS",
+                    "ENCENDIDO / CONECTADO",
+                    "APAGADO / SIN CONEXIÓN",
+                ],
+            )
+        with f3:
+            ordenar = st.selectbox(
+                "Ordenar por",
+                ["Más días sin reporte", "Unidad", "Cliente / Grupo"],
+            )
+
+        vista = criticos.copy()
+        if buscar.strip():
+            buscar_mask = (
+                vista["Unidad"].astype(str).str.contains(buscar, case=False, na=False)
+                | vista["Cliente / Grupo"].astype(str).str.contains(
+                    buscar, case=False, na=False
+                )
+            )
+            vista = vista[buscar_mask]
+        if filtro_estado != "Todos":
+            vista = vista[vista["Estado"] == filtro_estado]
+
+        if ordenar == "Más días sin reporte":
+            vista["_dias_num"] = pd.to_numeric(vista["Días Sin Reporte"], errors="coerce")
+            vista = vista.sort_values("_dias_num", ascending=False, na_position="first")
+        else:
+            vista = vista.sort_values(ordenar, na_position="last")
+
+        st.info(
+            f"Se muestran {len(vista)} unidad(es) que superan el umbral "
+            f"de {umbral_actual} horas."
+        )
+        vista_editor = vista[COLUMNAS_DIAGNOSTICO].copy()
+        editor = st.data_editor(
+            vista_editor,
+            key="editor_diagnostico",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=[
+                "Unidad", "Cliente / Grupo", "Contacto", "Teléfono WhatsApp",
+                "Último Reporte", "Días Sin Reporte", "Estado", "Conexión",
+                "Novedad Batería / Voltaje", "Diagnóstico",
+            ],
+            column_config={
+                "Contacto": st.column_config.TextColumn("Contacto leído del grupo Wialon"),
+                "Teléfono WhatsApp": st.column_config.TextColumn("Teléfono leído del grupo Wialon"),
+                "Observación": st.column_config.TextColumn("Observación / seguimiento"),
+            },
+        )
+
+        # ========================================================
+        # 8. GUARDAR, DESCARGAR Y SINCRONIZAR
+        # ========================================================
+        st.divider()
+        st.subheader("💾 Acciones del registro")
+        b1, b2, b3 = st.columns(3)
+
+        with b1:
+            if st.button(
+                "💾 Guardar observaciones",
+                use_container_width=True,
+                disabled=editor.empty,
+            ):
+                observadas = editor[
+                    editor["Observación"].fillna("").astype(str).str.strip().ne("")
+                ].copy()
+                if observadas.empty:
+                    st.warning("Escribe al menos una observación antes de guardar.")
+                else:
+                    observadas["Fecha Registro"] = datetime.now().astimezone().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    nuevas = observadas[COLUMNAS_HISTORIAL]
+                    try:
+                        cantidad = guardar_historico_local(nuevas)
+                        st.success(
+                            f"Se guardaron {len(nuevas)} observaciones. "
+                            f"Total acumulado local: {cantidad}."
+                        )
+                    except Exception as error:
+                        st.error(f"No se pudo guardar el histórico local: {error}")
+
+        with b2:
+            st.download_button(
+                "📥 Descargar diagnóstico Excel",
+                data=generar_excel(vista_editor),
+                file_name=f"Diagnostico_Wialon_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+        with b3:
+            if st.button("☁️ Guardar observaciones en Google Drive", use_container_width=True):
+                observadas = editor[
+                    editor["Observación"].fillna("").astype(str).str.strip().ne("")
+                ].copy()
+                if observadas.empty:
+                    st.warning("Escribe al menos una observación antes de sincronizar.")
+                else:
+                    observadas["Fecha Registro"] = datetime.now().astimezone().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    nuevas = observadas[COLUMNAS_HISTORIAL]
+                    try:
+                        with st.spinner("Sincronizando con Google Drive..."):
+                            cantidad = sincronizar_historico_drive(nuevas)
+                        st.success(
+                            f"Google Drive actualizado. Registros acumulados: {cantidad}."
+                        )
+                    except Exception as error:
+                        st.error(f"No se pudo sincronizar con Google Drive: {error}")
+
+        if os.path.exists(HISTORIAL_LOCAL_PATH):
+            with open(HISTORIAL_LOCAL_PATH, "rb") as archivo:
+                st.download_button(
+                    "📚 Descargar histórico local acumulado",
+                    data=archivo.read(),
+                    file_name="registro_observaciones.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+        st.caption(
+            "Nota: el almacenamiento local de Streamlit Community Cloud puede ser "
+            "efímero. Para conservar el histórico entre reinicios, configura Google Drive."
+        )
+
+        # ========================================================
+        # 9. WHATSAPP
+        # ========================================================
+        st.divider()
+        st.subheader("📲 Preparar aviso por WhatsApp")
+
+        if not editor.empty:
+            opciones = [
+                f"{fila['Unidad']} — {fila['Cliente / Grupo']}"
+                for _, fila in editor.iterrows()
+            ]
+            seleccion = st.selectbox("Selecciona la unidad", opciones)
+            posicion = opciones.index(seleccion)
+            fila = editor.iloc[posicion]
+
+            observacion = str(fila["Observación"]).strip()
+            mensaje_default = (
+                f"Estimado cliente ({fila['Cliente / Grupo']}), desde Korban Global "
+                f"Solutions le informamos que la unidad {fila['Unidad']} presenta "
+                f"la siguiente novedad: {fila['Conexión']}. "
+                f"Diagnóstico: {fila['Diagnóstico']}\n\n"
+                f"Último reporte: {fila['Último Reporte']}.\n"
+                f"Tiempo sin reporte: {fila['Días Sin Reporte']} días.\n"
+                f"Batería/voltaje: {fila['Novedad Batería / Voltaje']}."
+            )
+            if observacion and observacion.lower() != "nan":
+                mensaje_default += f"\nObservación de soporte: {observacion}"
+
+            mensaje = st.text_area(
+                "Editar mensaje antes de abrir WhatsApp",
+                value=mensaje_default,
+                height=170,
+                key="mensaje_whatsapp",
+            )
+            numero = limpiar_telefono(fila.get("Teléfono WhatsApp", ""))
+            contacto = str(fila.get("Contacto", "") or "").strip()
+            st.caption(f"Contacto detectado en el grupo: {contacto or 'No configurado'}")
+            if numero and numero.lower() != "nan":
+                enlace = f"https://wa.me/{numero}?text={urllib.parse.quote(mensaje)}"
+                st.link_button("💬 Abrir WhatsApp con mensaje preparado", enlace)
+            else:
+                st.warning(
+                    "No se puede preparar WhatsApp porque el grupo no tiene un teléfono "
+                    "válido en sus campos personalizados, o la unidad pertenece a grupos "
+                    "con números distintos. Revisa el campo 'Teléfono' o 'Teléfono WhatsApp' "
+                    "del grupo en Wialon. Usa código de país y solo dígitos."
+                )
+        else:
+            st.info("No hay unidades críticas que coincidan con los filtros actuales.")
+
+        # ========================================================
+        # 10. TODAS LAS UNIDADES
+        # ========================================================
+        with st.expander("🔎 Ver todas las unidades evaluadas"):
+            st.dataframe(
+                df_all[COLUMNAS_DIAGNOSTICO],
+                use_container_width=True,
+                hide_index=True,
+            )

@@ -517,11 +517,20 @@ def sincronizar_historico_drive(df_nuevas):
         while not terminado:
             _, terminado = descargador.next_chunk()
         buffer_descarga.seek(0)
-        anterior = pd.read_excel(buffer_descarga)
+        try:
+            anterior = pd.read_excel(buffer_descarga)
+        except Exception:
+            anterior = pd.DataFrame(columns=COLUMNAS_HISTORIAL)
         completo = pd.concat([anterior, df_nuevas], ignore_index=True)
     else:
-        file_id = None
-        completo = df_nuevas.copy()
+        # La cuenta de servicio NO tiene cuota de almacenamiento, por lo que no
+        # puede crear archivos en un Mi unidad personal. El archivo debe existir
+        # previamente (subido por una persona) y estar compartido como Editor.
+        raise RuntimeError(
+            f"No se encontró '{HISTORIAL_DRIVE_NAME}' en la carpeta de Drive. "
+            "Sube manualmente la plantilla .xlsx (con ese nombre exacto) a la "
+            "carpeta y compártela como Editor con el correo de la cuenta de servicio."
+        )
 
     buffer_subida = io.BytesIO()
     with pd.ExcelWriter(buffer_subida, engine="openpyxl") as escritor:
@@ -534,19 +543,11 @@ def sincronizar_historico_drive(df_nuevas):
         resumable=False,
     )
 
-    if file_id:
-        servicio.files().update(
-            fileId=file_id,
-            media_body=media,
-            supportsAllDrives=True,
-        ).execute()
-    else:
-        servicio.files().create(
-            body={"name": HISTORIAL_DRIVE_NAME, "parents": [folder_id]},
-            media_body=media,
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
+    servicio.files().update(
+        fileId=file_id,
+        media_body=media,
+        supportsAllDrives=True,
+    ).execute()
 
     # Guarda también una copia local cuando el entorno permite escribirla.
     try:
